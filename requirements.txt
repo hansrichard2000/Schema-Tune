@@ -1,0 +1,6 @@
+transformers==4.40.2
+datasets==2.19.1
+accelerate==0.21.0
+botorch==0.9.1
+gpytorch==1.11
+torch==2.2.1+cu121
