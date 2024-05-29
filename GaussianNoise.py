@@ -187,7 +187,7 @@ class Noise:
             singular_values = singular_values.cpu().detach().numpy()
 
         # Plot the singular values
-        print ("singular_values",singular_values)
+        print ("Singular_values",singular_values)
         plt.plot(singular_values)
         plt.xlabel('Number of Components')
         plt.ylabel('Singular Value')
@@ -268,7 +268,7 @@ class Noise:
               # Store perturbed embeddings
               U[i] = perturbed_embeddings.unsqueeze(0)
 
-      print("this is U", U)
+      print("This is U: ", U)
       return U
 
     def get_variances(self):
@@ -480,7 +480,9 @@ class Noise:
         raw_samples=self.bayesian_raw_samples
         #batch_limit=8
 
-        print ("entering the function bo")
+        #print ("Entering the function bo")
+        print ("Entering the function for Bayesian Optimization")
+
         print_gpu_usage()
         #upsampleq=3
         upsampleq=self.upsample_quotient
@@ -512,14 +514,14 @@ class Noise:
             #init_x = self.default_values  # Ensure init_x is double
             init_x = self.initialize_data()
             init_x=init_x.to(device_cpu)
-            print ("init_x", init_x.size())
+            print ("Init_x", init_x.size())
 
             with torch.no_grad():
 
                 init_y = self.problem(init_x, actor, PLM).detach().double()
 
             init_y = init_y.view(init_x.size(0), 1)  # Ensure init_y is double
-            print(init_x.size(), init_y.size(), "final")
+            print(init_x.size(), init_y.size(), "Final")
 
             init_y=init_y.to(device_cpu )
             
@@ -539,7 +541,7 @@ class Noise:
             self.Y_all= self.Y_all.to(device_cpu)
             self.Y_all = torch.cat([self.Y_all, init_y.detach()], dim=0)#.view(-1, 1)
             
-            print ("sizes", init_x_flat.size(), init_y.size(), self.X_all.size(), self.Y_all.size())
+            print ("Sizes: ", init_x_flat.size(), init_y.size(), self.X_all.size(), self.Y_all.size())
 
             self.best_value = best_value
             self.start_cond = False
@@ -570,7 +572,7 @@ class Noise:
             prune_baseline=True,
         )
 
-        print ("finished acq")
+        print ("Finished acq")
         candidate, _ = optimize_acqf(
             acq_function=acqf,
             bounds=bounds_tensor,
@@ -624,7 +626,7 @@ class Noise:
         best_mu = best_mu.to(device_cpu)
 
         self.best_X = candidates[best_indices]
-        print ("self.best_X.shape",self.best_X.shape)
+        #print ("self.best_X.shape",self.best_X.shape)
 
         new_y_flat = new_y_flat.to(device_cpu).view(upsampleq*self.batch_size,1)
 
@@ -795,7 +797,7 @@ class Noise:
             # Generate a new base_value for each i, to be used across all batches, j, and k
             base_value = lower_bound + (upper_bound - lower_bound) * torch.rand(1)
             #print ( "self.bounds", self.bounds)
-            print ( "base_value", base_value)
+            print ("Base value: ", base_value)
             for b in range(self.batch_size):
                 for j in range(self.num_groups_per_pair):
                     for k in range(self.num_groups):
@@ -888,8 +890,8 @@ class ActorNetwork(nn.Module,metaclass=SingletonType):
                 
             elif match and self.current_epoch>2:
                 layer_index = int(match.group(1))  # Convert captured layer index to integer
-                print ("layer_index",layer_index)
-                print ("match", match)
+                #print ("layer_index",layer_index)
+                #print ("match", match)
                 # Calculate the layer to start unfreezing from, based on the current epoch
                 #if layer_index >= start_unfreeze_layer:
                 param.requires_grad = True  
@@ -929,46 +931,6 @@ class ActorNetwork(nn.Module,metaclass=SingletonType):
         # Setup the scheduler with the optimizer
         self.scheduler = optim.lr_scheduler.CosineAnnealingLR(self.optimizer, T_max=self.num_batches)
 
-    def forward_text(self, text): # this forward's output is aka state
-        inputs= self.tokenizer(text, return_tensors='pt')
-        self.model = self.model.to(self.device)
-
-        # Move the inputs to the correct device
-        inputs = {key: val.to(self.device) for key, val in inputs.items()}
-
-        # Ensure the model is on the correct device
-        #self.model.eval()
-        outputs = self.model(**inputs)
-
-        return outputs.hidden_states[-1].squeeze(0)
-
-
-    def forward_action(self, action):
-        self.model = self.model.to(self.device)
-        outputs = self.model.transformer(inputs_embeds=action)
-
-        return outputs#.hidden_states[-1].squeeze(0)
-
-
-    def forward_group(self, text, group_idx):
-        inputs = self.tokenizer(text, return_tensors='pt')
-        inputs = {key: value.to(self.device) for key, value in inputs.items()}
-        #self.model.eval()
-        outputs = self.model(**inputs)
-
-        # Get the last hidden state
-        last_hidden_states = outputs.hidden_states[-1].squeeze(0)  # Last layer hidden states
-
-        if isinstance(group_idx, int):
-            group_x = last_hidden_states.squeeze()[group_idx]
-
-        elif isinstance(group_idx, list):
-            group_x = T.mean(last_hidden_states.squeeze()[group_idx[0]:group_idx[-1]+1], dim=0)
-        else:
-            raise TypeError("group_idx must be either an integer or a list/tuple of integers.")
-
-        return group_x
-
     def forward_wte(self, sentence):
         inputs = self.tokenizer(sentence, return_tensors="pt")
 
@@ -980,20 +942,6 @@ class ActorNetwork(nn.Module,metaclass=SingletonType):
             embeddings = self.model.transformer.wte(input_ids)
 
         return embeddings
-
-    def forward_logits(self, sentence):
-        inputs = self.tokenizer(sentence, return_tensors='pt')
-        input_ids = inputs['input_ids'].to(self.device)
-        self.model = self.model.to(self.device)
-        #self.model.eval()
-        with T.no_grad():
-            outputs = self.model(input_ids)
-
-        # GPT-2 directly outputs logits as part of its forward pass
-        logits = outputs.logits
-        logits = logits.squeeze(0)  # Remove the batch dimension if necessary
-
-        return logits
 
     def resize_token_embeddings(self, new_num_tokens=None):
         if new_num_tokens is None:
@@ -1016,7 +964,7 @@ class ActorNetwork(nn.Module,metaclass=SingletonType):
         }
 
         # Save the checkpoint
-        print('Saving checkpoint to:', checkpoint_file)
+        print('Saving checkpoint to path:', checkpoint_file)
         T.save(checkpoint, checkpoint_file)
 
         # Optional: Confirm the file has been saved
@@ -1179,8 +1127,8 @@ class Reward(object):
         #print("combined_reward",combined_reward)
         self.NoiseE.append(batchNoiseEval.mean(0))
         self.klp.append((klG1 + klG2).mean(0)*1)
-        print ("batchNoiseEvalmagnified ,", batchNoiseEval ,"lambda1*(klG1+ klG2):",  1*(klG1+ klG2))
-        print ("batchNoiseEvalmagnified ,", batchNoiseEval)
+        #print ("batchNoiseEvalmagnified ,", batchNoiseEval ,"lambda1*(klG1+ klG2):",  1*(klG1+ klG2))
+        #print ("batchNoiseEvalmagnified ,", batchNoiseEval)
         self.garbage_dict_count += 1
         self.garbage_dict[self.garbage_dict_count] = batchNoiseEval
         self.garbage_dict_count += 1
@@ -1346,7 +1294,7 @@ class Reward(object):
 
         # Tokenize the sentence template without the mask token and the trait
         sentence = tmplt.replace('<mask>', '') #+ trait
-        print ("sentence",sentence)
+        print ("Sentence ",sentence)
 
         inputs = LM.tokenizer(sentence, return_tensors='pt')
         inputs = {key: value.to(device) for key, value in inputs.items()}
@@ -1366,7 +1314,7 @@ class Reward(object):
             logits = outputs["logits"]
         #outputs= self.to_cpu(outputs)
 
-        print ("logits.size()",logits.size())
+        print ("logits.size() = ",logits.size())
         #logits=logits.to(torch.device("cpu"))
         #pdb.set_trace()
 

@@ -81,42 +81,6 @@ class LanguageModel(nn.Module, metaclass=SingletonType):
 
         return outputs.hidden_states[-1]  # return embeddings , later check if you need to access specific index of it
 
-    def forward_group(self, text, group_idx):
-        device = T.device('cuda')
-        inputs = self.tokenizer(text, return_tensors='pt')
-        inputs = {key: value.to(device) for key, value in inputs.items()}
-        #self.model.eval()
-        outputs = self.model(**inputs)
-
-        # Get the last hidden state
-        #last_hidden_states = outputs.hidden_states[-1]
-        last_hidden_states = outputs.hidden_states[12]  # Last layer hidden states
-
-        if isinstance(group_idx, int):
-            group_x = last_hidden_states.squeeze()[group_idx]
-        elif isinstance(group_idx, list):
-            group_x = T.mean(last_hidden_states.squeeze()[group_idx[0]:group_idx[-1]+1], dim=0)
-        else:
-            raise TypeError("group_idx must be either an integer or a list/tuple of integers.")
-
-        return group_x
-
-    def forward_logits(self, sentence):
-
-        inputs = self.tokenizer(sentence, return_tensors='pt')
-        input_ids = inputs['input_ids'].to(self.device)
-
-        #self.model.eval()
-        with T.no_grad():
-            outputs = self.model(input_ids)
-            #last_hidden_state = outputs.last_hidden_state
-
-        # GPT-2 directly outputs logits as part of its forward pass
-        logits = outputs.logits.squeeze(0)
-        # Remove the batch dimension if necessary
-
-        return logits
-
     def forward_wte(self, sentence):
 
         inputs = self.tokenizer(sentence, return_tensors="pt")
@@ -130,12 +94,6 @@ class LanguageModel(nn.Module, metaclass=SingletonType):
             embeddings = self.model.transformer.wte(input_ids)
         
         return embeddings
-
-    def forward_action(self, action):
-        self.model = self.model.to(self.device)
-        outputs = self.model.transformer(inputs_embeds=action)
-
-        return outputs#.hidden_states[-1].squeeze(0)
 
     def forward(self, model, candidate_set):
         # Number of samples for each strategy
