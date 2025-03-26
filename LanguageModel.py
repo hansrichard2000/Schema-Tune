@@ -56,7 +56,7 @@ class LanguageModel(nn.Module, metaclass=SingletonType):
         
         self.short_model_name= model_prefix
         self.model_name = self.short_model_name #language_model_dict[model_prefix]
-        selected_gpu = sys.argv[1]
+        selected_gpu = sys.argv[0]
         dev = 'cuda' if torch.cuda.is_available() else 'cpu'
         self.device = torch.device(dev)
 

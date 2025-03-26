@@ -173,7 +173,7 @@ class LearningAgent(object):
 
     def calculate_prob(self,LM, inputs):
         tokenizer = GPT2Tokenizer.from_pretrained('gpt2')
-        selected_gpu = sys.argv[1]
+        selected_gpu = sys.argv[0]
         dev = 'cuda' if torch.cuda.is_available() else 'cpu'
         device = torch.device(dev) #torch.device(f'cuda:{selected_gpu}')
 
