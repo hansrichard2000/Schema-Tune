@@ -107,7 +107,7 @@ def print_gpu_usage():
 def main():
     # logging.warning('This is a warning')
     # logging.info('This is an informational message')
-    selected_gpu = sys.argv[1]
+    selected_gpu = sys.argv[0]
     os.environ['PYTORCH_CUDA_ALLOC_CONF'] = 'expandable_segments:True'
     dev = 'cuda' if torch.cuda.is_available() else 'cpu'
     device = torch.device(dev)

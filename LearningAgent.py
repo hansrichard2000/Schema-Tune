@@ -173,7 +173,7 @@ class LearningAgent(object):
 
     def calculate_prob(self,LM, inputs):
         tokenizer = GPT2Tokenizer.from_pretrained('gpt2')
-        selected_gpu = sys.argv[1]
+        selected_gpu = sys.argv[0]
         dev = 'cuda' if torch.cuda.is_available() else 'cpu'
         device = torch.device(dev) #torch.device(f'cuda:{selected_gpu}')
 
@@ -261,7 +261,7 @@ class LearningAgent(object):
         #lm_head_model =ActorNetwork('actor', PLM, device, in_net, in_net_init_identity, out_net, out_net_init_identity, freeze_ln, freeze_pos, freeze_wte, freeze_ff, freeze_attn, dup_lm_head, dup_lm_head_bias, chkpt_dir).to(device)
         lm_head_model= PLM.model
 
-        selected_gpu = sys.argv[1]
+        selected_gpu = sys.argv[0]
 
         checkpoint = torch.load(checkpoint_file, map_location=torch.device(device))
 

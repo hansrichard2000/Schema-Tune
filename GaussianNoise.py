@@ -1282,7 +1282,7 @@ class Reward(object):
 
     # SAME AS LOG PROB, WE CAN NOT PREDICT FORWARD WITH A VERY LOW LOGIT AN DTHEN ADD THIS, THE REUSLT REMAINS NEGLIGIBLE.
     def get_neutral_score(self, LM, tmplt, trait):# here you should predict multi token based on a sentence that you already added to the current trait token.
-        selected_gpu = sys.argv[1]
+        selected_gpu = sys.argv[0]
 
         device = self.device #torch.device(f'cuda:{selected_gpu}')
 
@@ -1360,7 +1360,7 @@ class Reward(object):
         return logit_sum
 
     def calculate_logits(self, LM, tmplt, mu_prime_g, inputs, group):
-        selected_gpu = sys.argv[1]
+        selected_gpu = sys.argv[0]
 
         device = self.device #torch.device(f'cuda:{selected_gpu}')
 
@@ -1585,7 +1585,7 @@ class Reward(object):
 
     def get_top_token_probabilities(self, LM, mu_prime_g, sentence, group, num_predictions=200):
       # Set device for computation
-        selected_gpu = sys.argv[1]
+        selected_gpu = sys.argv[0]
 
         device = self.device #torch.device(f'cuda:{selected_gpu}')
 
@@ -1701,7 +1701,7 @@ class Reward(object):
                     input_txt = tmplt.replace('<mask>', '').replace('<group>', group)
                     inputs = LM.tokenizer(input_txt, return_tensors='pt')
 
-                    selected_gpu = sys.argv[1]
+                    selected_gpu = sys.argv[0]
 
                     #inputs = {key: value.to(torch.device(f'cuda:{selected_gpu}')) for key, value in inputs.items()}
                     inputs = {key: value.to(self.device) for key, value in inputs.items()}
