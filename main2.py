@@ -132,7 +132,7 @@ def main():
 
 def test_saved_model():
     device = torch.device('cuda')
-    LM_name = "gpt-2"
+    LM_name = "mistral"
     actor_lr=2e-4
     ###actor settings
     in_net=False

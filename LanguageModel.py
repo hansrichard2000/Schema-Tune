@@ -15,7 +15,7 @@ import torch as T
 
 import torch.nn as nn
 
-from transformers import GPT2LMHeadModel, GPT2Tokenizer
+from transformers import AutoTokenizer, AutoModelForCausalLM
 
 
 from torch.nn import CrossEntropyLoss
@@ -50,34 +50,36 @@ class SingletonType(type):
         return cls._instances[cls]
 
 class LanguageModel(nn.Module, metaclass=SingletonType):
-    def __init__(self, model_prefix='gpt2'):
+    def __init__(self, model_prefix='mistralai/Mistral-7B-v0.1'):
         super(LanguageModel, self).__init__()
 
-        
         self.short_model_name= model_prefix
         self.model_name = self.short_model_name #language_model_dict[model_prefix]
         selected_gpu = sys.argv[0]
         dev = 'cuda' if torch.cuda.is_available() else 'cpu'
         self.device = torch.device(dev)
 
-        self.tokenizer = GPT2Tokenizer.from_pretrained(model_prefix)
-        self.model = GPT2LMHeadModel.from_pretrained(model_prefix, output_hidden_states=True).to(self.device)
+        self.tokenizer = AutoTokenizer.from_pretrained(model_prefix)
+        self.tokenizer.pad_token = self.tokenizer.eos_token
+        
+        # self.model = GPT2LMHeadModel.from_pretrained(model_prefix, output_hidden_states=True).to(self.device)
+        
+        self.model = AutoModelForCausalLM.from_pretrained(
+            model_prefix,
+            torch_dtype=torch.bfloat16,
+            device_map="cuda",
+            trust_remote_code=True,
+        )
+        self.model.to(self.device)
+
         self.d_model = self.model.config.hidden_size
         self.hidden_size = self.model.config.hidden_size
         self.num_labels = self.model.config.vocab_size
         self.type = 'p'
 
     def forward(self, text):
-
-        inputs= self.tokenizer(text, return_tensors='pt')
-
-        # Move the inputs to the correct device
-        inputs = {key: val.to(self.device) for key, val in inputs.items()}
-
-        # Ensure the model is on the correct device
-        self.model.to(self.device)
-        #self.model.eval()
-        outputs = self.model(**inputs)
+        inputs= self.tokenizer(text, return_tensors='pt').to(self.device)
+        outputs = self.model(**inputs, output_hidden_states=True)
 
         return outputs.hidden_states[-1]  # return embeddings , later check if you need to access specific index of it
 
@@ -95,30 +97,30 @@ class LanguageModel(nn.Module, metaclass=SingletonType):
         
         return embeddings
 
-    def forward(self, model, candidate_set):
-        # Number of samples for each strategy
-        num_samples_iid = int(self._num_samples * self.weight)
-        num_samples_thompson = self._num_samples - num_samples_iid
+    # def forward(self, model, candidate_set):
+    #     # Number of samples for each strategy
+    #     num_samples_iid = int(self._num_samples * self.weight)
+    #     num_samples_thompson = self._num_samples - num_samples_iid
 
-        # IID Normal Sampling
-        iid_samples = torch.randn(num_samples_iid, candidate_set.shape[-1], device=candidate_set.device)
+    #     # IID Normal Sampling
+    #     iid_samples = torch.randn(num_samples_iid, candidate_set.shape[-1], device=candidate_set.device)
 
-        # Thompson Sampling
-        model.eval()
-        with torch.no_grad():
-            # Calculate the range (upper bound - lower bound) for each dimension
-            bounds_range = self.bounds[1] - self.bounds[0]
+    #     # Thompson Sampling
+    #     model.eval()
+    #     with torch.no_grad():
+    #         # Calculate the range (upper bound - lower bound) for each dimension
+    #         bounds_range = self.bounds[1] - self.bounds[0]
 
-            # Generate random points within the bounds for each dimension
-            # The shape of random_points will be (num_samples_thompson, candidate_set.shape[-1])
-            random_points = self.bounds[0] + bounds_range * torch.rand(num_samples_thompson, candidate_set.shape[-1], device=candidate_set.device)
+    #         # Generate random points within the bounds for each dimension
+    #         # The shape of random_points will be (num_samples_thompson, candidate_set.shape[-1])
+    #         random_points = self.bounds[0] + bounds_range * torch.rand(num_samples_thompson, candidate_set.shape[-1], device=candidate_set.device)
 
-            # Obtain the posterior distribution at these random points
-            posterior = model.posterior(random_points)
+    #         # Obtain the posterior distribution at these random points
+    #         posterior = model.posterior(random_points)
 
-            # Sample from the posterior distribution
-            thompson_samples = posterior.sample(sample_shape=torch.Size([num_samples_thompson]))
-        # Combine both sets of samples
-        combined_samples = torch.cat([iid_samples, thompson_samples], dim=0)
+    #         # Sample from the posterior distribution
+    #         thompson_samples = posterior.sample(sample_shape=torch.Size([num_samples_thompson]))
+    #     # Combine both sets of samples
+    #     combined_samples = torch.cat([iid_samples, thompson_samples], dim=0)
 
-        return combined_samples
+    #     return combined_samples

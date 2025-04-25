@@ -111,7 +111,11 @@ class Noise:
     def __init__(self, actor, PLM, reward_obj, sampling_group_pairs, device, batch_size, traits, bayesian_samples, bayesian_raw_samples, variance_scale_factor, template, num_samples, maxiter, improvement_threshold, mixed_sampling_weight,num_restarts,
                     raw_samples,batch_limit,upsample_quotient):
         #self.lambda1=lambda1
-        self.num_tokens=2
+        self.num_tokens= max(
+            len(actor.tokenizer.encode(" " + word, add_special_tokens=False))
+            for pair in self.sampling_group_pairs
+            for word in pair
+        )
         self.num_samples=num_samples
         self.maxiter=maxiter
         self.improvement_threshold=improvement_threshold
@@ -158,8 +162,8 @@ class Noise:
         self.bayesian_samples = bayesian_samples
         self.bayesian_raw_samples = bayesian_raw_samples
 
-    # Function to get GPT-2 static embeddings
-    def get_gpt2_static_embedding(self, word, actor):
+    # Function to get Mistral static embeddings
+    def get_mistral_static_embedding(self, word, actor):
         # Generate the sentence using the template
         sentence = self.template.format(word)
 
@@ -168,16 +172,19 @@ class Noise:
         input_ids = tokenized_input['input_ids'].squeeze().to(self.device)
 
         # Find the indices corresponding to the word
-        word_token = actor.tokenizer.tokenize('Ġ' + word)
-        word_ids = actor.tokenizer.convert_tokens_to_ids(word_token)
+        word_tokens = actor.tokenizer.tokenize(word)
+        word_ids = actor.tokenizer.convert_tokens_to_ids(word_tokens)
         word_indices = [i for i, token_id in enumerate(input_ids.tolist()) if token_id in word_ids]
 
         # Calculate the sentence embeddings
         with torch.no_grad():  # Ensure no gradients are calculated
-          sentence_embedding = actor.model.transformer.wte(input_ids)
+            sentence_embedding = actor.model.embed_tokens(input_ids)
 
-        # Extract the embedding for the word
-        word_embedding = sentence_embedding[word_indices, :].mean(dim=0)
+        if not word_indices:
+            # Fallback: use average of all embeddings
+            word_embedding = sentence_embedding.mean(dim=0)
+        else:
+            word_embedding = sentence_embedding[word_indices, :].mean(dim=0)
 
         return word_embedding
 
@@ -221,7 +228,7 @@ class Noise:
         return U_approx, S_approx, Vt_approx
 
     def bias_subspace(self, actor):
-      U = torch.zeros(len(self.sampling_group_pairs), self.num_tokens, actor.model.config.n_embd)
+      U = torch.zeros(len(self.sampling_group_pairs), self.num_tokens, actor.model.config.hidden_size, device=self.device)
       S = torch.zeros(len(self.sampling_group_pairs))
 
       for i, (word1, word2) in enumerate(self.sampling_group_pairs):
@@ -235,8 +242,8 @@ class Noise:
               tokens_2 = tokens_2['input_ids'].squeeze().to(self.device)
 
               # Get embeddings
-              embeddings_1 = actor.model.transformer.wte(tokens_1)
-              embeddings_2 = actor.model.transformer.wte(tokens_2)
+              embeddings_1 = actor.model.model.embed_tokens(tokens_1)
+              embeddings_2 = actor.model.model.embed_tokens(tokens_2)
 
               # Calculate the standard deviation for the Gaussian noise based on the max values
               max_values = torch.max(embeddings_1, embeddings_2)
@@ -369,7 +376,7 @@ class Noise:
       return unnorm_tensor
 
     def calculate_mu_prime_B(self,  X, actor, PLM):
-        X_reshaped = X.view(-1, self.bias_subspace_dim, self.num_groups_per_pair, self.num_groups)
+        X_reshaped = X.reshape(-1, self.bias_subspace_dim, self.num_groups_per_pair, self.num_groups)
         #batch_rewards = torch.empty(X_reshaped.size(0), 1, device=self.device)
         noise_tensor = self.gaussian_noise_subspace(X_reshaped).detach()
         mu_prime_B = self.calculate_noisy_embeddings(self.group_embeddings.detach(), noise_tensor, True).to(self.device)
@@ -401,7 +408,7 @@ class Noise:
     def problem(self, X, actor, PLM):
         # X is expected to be of shape [num_candidates, num_features]
 
-        X_reshaped = X.view(-1, self.bias_subspace_dim, self.num_groups_per_pair, self.num_groups)
+        X_reshaped = X.reshape(-1, self.bias_subspace_dim, self.num_groups_per_pair, self.num_groups)
         print (torch.isnan(X_reshaped).any(),"X_reshaped.nan)")
         # Initialize a tensor to store the rewards
         batch_rewards = torch.empty(X_reshaped.size(0), 1, device=self.device)
@@ -445,7 +452,7 @@ class Noise:
         # Convert X from NumPy array to PyTorch tensor with the same dimensionality
         X_tensor = torch.tensor(X, dtype=torch.float32, device=self.device)
         
-        X_reshaped = X_tensor.view(-1, self.bias_subspace_dim, self.num_groups_per_pair, self.num_groups)
+        X_reshaped = X_tensor.reshape(-1, self.bias_subspace_dim, self.num_groups_per_pair, self.num_groups)
         print(torch.isnan(X_reshaped).any(), "X_reshaped.nan)")
         
         # Initialize a tensor to store the rewards
@@ -488,7 +495,7 @@ class Noise:
         upsampleq=self.upsample_quotient
         gc.collect()
         torch.cuda.empty_cache()
-        device_cpu = torch.device("cpu")
+        # device_cpu = torch.device("cpu")
         N_W = raw_samples
         STD_DEV = 0.05
         ALPHA = 0.8
@@ -502,18 +509,18 @@ class Noise:
 
         # Transpose the tensor to get the desired shape
         bounds_tensor = bounds_tensor.T
-        bounds_tensor=bounds_tensor.to(device_cpu)
+        bounds_tensor=bounds_tensor.to(self.device)
         self.group_embeddings = self.calculate_embeddings(actor)
         if self.start_cond == True:
             self.X_all = torch.empty(0, self.bias_subspace_dim * self.num_groups_per_pair * self.num_groups).double()
             self.Y_all = torch.empty(0,1).double()
             self.best_X= torch.empty(0, self.bias_subspace_dim * self.num_groups_per_pair * self.num_groups).double()
             self.best_Y= torch.empty(0,1).double()
-            self.X_all=self.X_all.to(device_cpu)
+            self.X_all=self.X_all.to(self.device)
 
             #init_x = self.default_values  # Ensure init_x is double
             init_x = self.initialize_data()
-            init_x=init_x.to(device_cpu)
+            init_x=init_x.to(self.device)
             print ("Init_x", init_x.size())
 
             with torch.no_grad():
@@ -523,9 +530,9 @@ class Noise:
             init_y = init_y.view(init_x.size(0), 1)  # Ensure init_y is double
             print(init_x.size(), init_y.size(), "Final")
 
-            init_y=init_y.to(device_cpu )
+            init_y=init_y.to(self.device)
             
-            init_x_flat = init_x.view(-1, self.bias_subspace_dim * self.num_groups_per_pair * self.num_groups).detach().double()  # Ensure init_x_flat is double
+            init_x_flat = init_x.reshape(-1, self.bias_subspace_dim * self.num_groups_per_pair * self.num_groups).detach().double()  # Ensure init_x_flat is double
             task_feature=init_x_flat.shape[-1] - 1
             #likelihood = MultitaskGaussianLikelihood(num_tasks=total_num_tasks)
 
@@ -538,7 +545,7 @@ class Noise:
                 fit_gpytorch_model(mll)
 
             self.X_all = torch.cat([self.X_all, init_x_flat], dim=0)
-            self.Y_all= self.Y_all.to(device_cpu)
+            self.Y_all= self.Y_all.to(self.device)
             self.Y_all = torch.cat([self.Y_all, init_y.detach()], dim=0)#.view(-1, 1)
             
             print ("Sizes: ", init_x_flat.size(), init_y.size(), self.X_all.size(), self.Y_all.size())
@@ -552,14 +559,14 @@ class Noise:
 
             # Ensure init_y is double
 
-            init_x_flat = init_x.view(-1, self.bias_subspace_dim * self.num_groups_per_pair * self.num_groups).double()  # Ensure init_x_flat is double
+            init_x_flat = init_x.reshape(-1, self.bias_subspace_dim * self.num_groups_per_pair * self.num_groups).double()  # Ensure init_x_flat is double
             # init_y = self.problem(init_x_flat, actor, PLM).double()
             # init_y= standardize(init_y + 0.05 * torch.randn_like(init_y))
             # #init_y = standardize(init_y + 1e-1 * torch.randn_like(init_y))
 
         d = init_x_flat.shape[-1]
 
-        self.model.to(device_cpu )
+        self.model.to(self.device)
         mll = gpytorch.mlls.ExactMarginalLogLikelihood(self.model.likelihood, self.model)
 
         sampler = SobolQMCNormalSampler(sample_shape=torch.Size([num_samples]))
@@ -618,17 +625,17 @@ class Noise:
         sorted_indices = torch.argsort(new_y_flat, descending=True)  # Change to ascending=False if you want to minimize
 
         # Select the top batch_size candidates
-        candidates=candidates.to(device_cpu)
+        candidates=candidates.to(self.device)
         best_indices = sorted_indices[:self.batch_size]
-        best_indices=best_indices.to(device_cpu)
+        best_indices=best_indices.to(self.device)
         best_mu = new_mu_flat[best_indices].squeeze(dim=1)
 
-        best_mu = best_mu.to(device_cpu)
+        best_mu = best_mu.to(self.device)
 
         self.best_X = candidates[best_indices]
         #print ("self.best_X.shape",self.best_X.shape)
 
-        new_y_flat = new_y_flat.to(device_cpu).view(upsampleq*self.batch_size,1)
+        new_y_flat = new_y_flat.to(self.device).view(upsampleq*self.batch_size,1)
 
         self.best_Y = new_y_flat[best_indices]
 
@@ -657,11 +664,11 @@ class Noise:
         #     )
 
         inpf=Normalize(d=self.X_all.shape[-1])
-        self.model.to(device_cpu)
-        self.X_all = self.X_all.to(device_cpu)
-        self.Y_all = self.Y_all.to(device_cpu)
-        self.best_X = self.best_X.to(device_cpu)
-        self.best_Y = self.best_Y.to(device_cpu)
+        self.model.to(self.device)
+        self.X_all = self.X_all.to(self.device)
+        self.Y_all = self.Y_all.to(self.device)
+        self.best_X = self.best_X.to(self.device)
+        self.best_Y = self.best_Y.to(self.device)
 
         n_inducing_points = 10  # Number of inducing points you want to select
 
@@ -717,7 +724,7 @@ class Noise:
     def calculate_embedding(self,actor, sentence: str):
         #inputs = self.tokenizer(sentence, return_tensors='pt')
         with T.no_grad():
-            outputs = actor.forward_wte( sentence)#.squeeze(0)
+            outputs = actor.forward_wte(sentence)#.squeeze(0)
         
         return outputs
 
@@ -744,13 +751,22 @@ class Noise:
                 inputs = actor.tokenizer(sentence, return_tensors='pt')
                 inputs = {key: value.to(self.device) for key, value in inputs.items()}
 
-                group_token_id = actor.tokenizer.encode(" " + group)
+                # group_token_id = actor.tokenizer.encode(" " + group)
                 
-                group_start_positions = (inputs['input_ids'] == group_token_id[0]).nonzero(as_tuple=True)[1]
-                group_positions = [group_start_positions + i for i in range(len(group_token_id))]
+                # group_start_positions = (inputs['input_ids'] == group_token_id[0]).nonzero(as_tuple=True)[1]
+                # group_positions = [group_start_positions + i for i in range(len(group_token_id))]
+                
+                group_token_ids = actor.tokenizer.encode(" " + group, add_special_tokens=False)
+                input_ids = inputs["input_ids"].squeeze()
+                
+                # Find the start index where group_token_ids match
+                for idx in range(len(input_ids) - len(group_token_ids) + 1):
+                    if (input_ids[idx:idx + len(group_token_ids)] == torch.tensor(group_token_ids, device=self.device)).all():
+                        group_positions = list(range(idx, idx + len(group_token_ids)))
+                        break
 
                 # Calculate the sentence embeddings and extract the group embeddings
-                sentence_embedding = self.calculate_embedding(actor,  sentence)
+                sentence_embedding = self.calculate_embedding(actor, sentence)
                 group_embedding = sentence_embedding[group_positions, :]#.squeeze()#(dim=-1)
                 group_embedding.to(self.device)
                 if group_embedding.size(0) != 2:
@@ -815,6 +831,7 @@ class Noise:
 
         # Run Bayesian optimization and get the noise mean value
         bo_results = self.run_bayesian_optimization(actor, PLM, candidates)
+        return bo_results
 
     def sample_batch(self, actor, PLM, checknoise=True):
         group_embeddings = self.calculate_embeddings(actor).to(self.device) #T.zeros((self.num_groups, self.num_groups_per_pair,self.num_tokens, self.embedding_dim))  # Initialize tensor for embeddings
@@ -849,14 +866,14 @@ class ActorNetwork(nn.Module,metaclass=SingletonType):
         self.in_net= in_net
         self.out_net=out_net
         self.model = language_model.model.to(self.device)
-        self.input_dim = language_model.model.config.n_embd
+        self.input_dim = language_model.model.config.hidden_size
         self.dropout = lr_drop
         orth_gain = 1.41
         in_net_init_identity = True
         self.freeze_ln=freeze_ln
         self.freeze_wte= freeze_wte
         self.freeze_pos=freeze_pos
-        self.total_layers = len(self.model.transformer.h)
+        self.total_layers = len(self.model.model.layers)
         target_parameters = 0
 
         self.optimizer = torch.optim.AdamW(
@@ -881,49 +898,67 @@ class ActorNetwork(nn.Module,metaclass=SingletonType):
             # Initially freeze all parameters
             param.requires_grad = False
             
-            match = re.match(r'transformer\.h\.(\d+)\.(ln_[12]\.weight|ln_[12]\.bias)', name)
+            match = re.match(r"model\.layers\.(\d+)\.(input_layernorm|post_attention_layernorm)\.(weight|bias)", name)
 
             if self.current_epoch<2:
-                if 'ln_f.weight' in name or 'ln_f.bias' in name:
+                if 'model.norm' in name:
                     param.requires_grad = True
-                break
+                continue
                 
-            elif match and self.current_epoch>2:
+            elif match and self.current_epoch > 2:
                 layer_index = int(match.group(1))  # Convert captured layer index to integer
                 #print ("layer_index",layer_index)
                 #print ("match", match)
                 # Calculate the layer to start unfreezing from, based on the current epoch
-                #if layer_index >= start_unfreeze_layer:
-                param.requires_grad = True  
+                if layer_index >= start_unfreeze_layer:
+                    param.requires_grad = True  
             # if 'ln' in name or 'norm' in name:
             #     param.requires_grad = not self.freeze_ln
-
-            if 'wpe' in name or 'position_embeddings' in name or 'pos_drop' in name:
-                param.requires_grad = not self.freeze_pos
-
-            if 'wte' in name:  # Token embeddings
-                param.requires_grad = not self.freeze_wte
             
-            if self.current_epoch >5 and 'h.11' in name:
-                param.requires_grad =True
-                
-            if self.current_epoch >6 and 'h.10' in name:
-                param.requires_grad =True
+            # Optional: Unfreeze embeddings based on flags
+            if 'model.embed_tokens' in name:
+                param.requires_grad = not self.freeze_wte
+            if 'model.layers' in name and 'self_attn' in name:
+                param.requires_grad = not self.freeze_attn
+            if 'mlp' in name:
+                param.requires_grad = not self.freeze_ff
+            if 'rotary_emb' in name:
+                param.requires_grad = not self.freeze_pos
+            
+            # Additional selective unfreezing by epoch
+            if self.current_epoch > 5 and 'model.layers.31' in name:
+                param.requires_grad = True
+            if self.current_epoch > 6 and 'model.layers.30' in name:
+                param.requires_grad = True
+            if self.current_epoch > 7 and 'model.layers.29' in name:
+                param.requires_grad = True
+            
+            # if 'wpe' in name or 'position_embeddings' in name or 'pos_drop' in name:
+            #     param.requires_grad = not self.freeze_pos
 
-            if self.current_epoch >7 and 'h.9' in name:
-                param.requires_grad =True
+            # if 'wte' in name:  # Token embeddings
+            #     param.requires_grad = not self.freeze_wte
+            
+            # if self.current_epoch >5 and 'h.11' in name:
+            #     param.requires_grad =True
+                
+            # if self.current_epoch >6 and 'h.10' in name:
+            #     param.requires_grad =True
+
+            # if self.current_epoch >7 and 'h.9' in name:
+            #     param.requires_grad =True
 
             # You could add more specific conditions here based on your model's structure and training needs
 
-        base_params = [param for name, param in self.model.named_parameters() if 'h.11' not in name and param.requires_grad]
-        lm_head_params = [param for name, param in self.model.named_parameters() if 'ln.f' in name and param.requires_grad]
+        base_params = [p for n, p in self.model.named_parameters() if 'model.layers.31' not in n and p.requires_grad]
+        norm_params = [p for n, p in self.model.named_parameters() if 'model.norm' in n and p.requires_grad]
 
         # Now, set up the optimizer with different learning rates
-        if base_params or lm_head_params:
+        if base_params or norm_params:
             self.optimizer = torch.optim.AdamW([
                 {'params': base_params, 'lr': self.lr},  # Standard learning rate for base model parameters
                 #{'params': lm_head_params, 'lr': self.lr*0.1}  # Adjusted learning rate for LM head parameters
-                {'params': lm_head_params, 'lr': self.lr*self.dropout}
+                {'params': norm_params, 'lr': self.lr*self.dropout}
             ])
         else:
             raise ValueError("No parameters with requires_grad=True. Check your model's parameter setup.")
@@ -932,21 +967,21 @@ class ActorNetwork(nn.Module,metaclass=SingletonType):
         self.scheduler = optim.lr_scheduler.CosineAnnealingLR(self.optimizer, T_max=self.num_batches)
 
     def forward_wte(self, sentence):
-        inputs = self.tokenizer(sentence, return_tensors="pt")
+        inputs = self.tokenizer(sentence, return_tensors="pt").to(self.device)
 
         # Get the token ids and remove the batch dimension
-        input_ids = inputs['input_ids'].squeeze().to(self.device)
+        input_ids = inputs['input_ids'].squeeze(0)
 
         # Get the word token embeddings (WTE)
         with T.no_grad():
-            embeddings = self.model.transformer.wte(input_ids)
+            embeddings = self.model.model.embed_tokens(input_ids)
 
         return embeddings
 
     def resize_token_embeddings(self, new_num_tokens=None):
         if new_num_tokens is None:
             new_num_tokens = len(self.tokenizer)
-        self.core_model.resize_token_embeddings(new_num_tokens)
+        self.model.model.resize_token_embeddings(new_num_tokens)
 
     def save_checkpoint(self, checkpoint_name="checkpoint2.pth"):
         # Specify the folder in Google Drive to save the checkpoint
@@ -1002,9 +1037,11 @@ class ActorNetwork(nn.Module,metaclass=SingletonType):
     #     # Debugging: Load immediately to check
     #     checkpoint_debug = T.load(self.checkpoint_file)
     #     #print("hiii", checkpoint_debug.keys())
+    
     def load_checkpoint(self):
         print('... loading checkpoint ...')
-        self.load_state_dict(T.load(self.model.checkpoint_file, device=self.device))
+        state_dict = torch.load(self.checkpoint_file, map_location=self.device)
+        self.model.load_state_dict(state_dict)
 
 class CoVWeighting:
     def __init__(self, num_losses, device, decay_factor=0.25):
@@ -1106,64 +1143,165 @@ class Reward(object):
         self.num_epochs=0
         self.device_cpu = torch.device("cpu")
         self.CoVWeighting=CoVWeighting(2,self.device_cpu) 
-
-    def calculate_reward(self, mu_prime, LM, PLM, weighted=False, both= False):
-
-        #mu_prime, _= self.noise.sample_batch (LM)
-        batchNoiseEval= self.NoiseEval( LM, mu_prime, self.sampling_group_pairs, self.traits, None, "The <group> is <mask>")
         
-        if batchNoiseEval.size()[0] == self.batch_size:
-            prime=self.prime1
-
-        else:
-            prime= self.primeB
-
-        klG1, klG2= self.kl_perf( LM, PLM, mu_prime, prime, self.sampling_group_pairs, "The <group> is powerful")
-
-        fairness_coefficient=20
+    @torch.no_grad()
+    def compute_log_prob_causal(self, model, tokenizer, prompt: str, target: str):
+        """
+        Compute log-probability of target tokens given a prompt using a causal decoder-only model (like Mistral).
+        """
+        model.eval()
         
-        epsilon = 1e-6
+        # Full input = prompt + target
+        full_input = tokenizer(prompt + target, return_tensors="pt").to(self.device)
+        prompt_input = tokenizer(prompt, return_tensors="pt").to(self.device)
         
-        #print("combined_reward",combined_reward)
-        self.NoiseE.append(batchNoiseEval.mean(0))
-        self.klp.append((klG1 + klG2).mean(0)*1)
-        #print ("batchNoiseEvalmagnified ,", batchNoiseEval ,"lambda1*(klG1+ klG2):",  1*(klG1+ klG2))
-        #print ("batchNoiseEvalmagnified ,", batchNoiseEval)
-        self.garbage_dict_count += 1
-        self.garbage_dict[self.garbage_dict_count] = batchNoiseEval
-        self.garbage_dict_count += 1
-        self.garbage_dict[self.garbage_dict_count] = klG1
-        self.garbage_dict_count += 1
-        self.garbage_dict[self.garbage_dict_count] = klG2
+        input_ids = full_input.input_ids
+        prompt_len = prompt_input.input_ids.shape[-1]
+        
+        # Forward pass
+        outputs = model(**full_input)
+        logits = outputs.logits
+        
+        # Get the logits responsible for generating the target
+        target_logits = logits[:, prompt_len - 1:-1, :]  # shift by 1
+        
+        # Get target token ids
+        target_ids = input_ids[:, prompt_len:]
+        
+        # Compute log-probs
+        log_probs = F.log_softmax(target_logits, dim=-1)
+        target_log_probs = torch.gather(log_probs, dim=2, index=target_ids.unsqueeze(-1)).squeeze(-1)
+        
+        total_log_prob = target_log_probs.sum(dim=-1).item()
+        avg_log_prob = target_log_probs.mean(dim=-1).item()
+        
+        return total_log_prob, avg_log_prob
+
+    # def calculate_reward(self, mu_prime, LM, PLM, weighted=False, both= False):
+
+    #     #mu_prime, _= self.noise.sample_batch (LM)
+    #     batchNoiseEval= self.NoiseEval( LM, mu_prime, self.sampling_group_pairs, self.traits, None, "The <group> is")
+        
+    #     if batchNoiseEval.size()[0] == self.batch_size:
+    #         prime=self.prime1
+
+    #     else:
+    #         prime= self.primeB
+
+    #     klG1, klG2= self.kl_perf( LM, PLM, mu_prime, prime, self.sampling_group_pairs, "The <group> is powerful")
+
+    #     fairness_coefficient=20
+        
+    #     epsilon = 1e-6
+        
+    #     #print("combined_reward",combined_reward)
+    #     self.NoiseE.append(batchNoiseEval.mean(0))
+    #     self.klp.append((klG1 + klG2).mean(0)*1)
+    #     #print ("batchNoiseEvalmagnified ,", batchNoiseEval ,"lambda1*(klG1+ klG2):",  1*(klG1+ klG2))
+    #     #print ("batchNoiseEvalmagnified ,", batchNoiseEval)
+    #     self.garbage_dict_count += 1
+    #     self.garbage_dict[self.garbage_dict_count] = batchNoiseEval
+    #     self.garbage_dict_count += 1
+    #     self.garbage_dict[self.garbage_dict_count] = klG1
+    #     self.garbage_dict_count += 1
+    #     self.garbage_dict[self.garbage_dict_count] = klG2
 
                 
-        # Assuming performance_loss and fairness_loss are already defined
+    #     # Assuming performance_loss and fairness_loss are already defined
         
-        FAIRNESS_PRIORITY_ratio = 0.1  # Threshold for when to prioritize fairness
-        performance_coefficient = 1
-        # Condition to check if performance is satisfactory or if fairness needs prioritization
+    #     FAIRNESS_PRIORITY_ratio = 0.1  # Threshold for when to prioritize fairness
+    #     performance_coefficient = 1
+    #     # Condition to check if performance is satisfactory or if fairness needs prioritization
         
 
-        # if self.num_iterations>60:
-        #     while torch.min(batchNoiseEval*fairness_coefficient / (-lambda1 * performance_coefficient*(klG1 + klG2))) < FAIRNESS_PRIORITY_ratio:
-        #         # Adjust the performance coefficient to prioritize fairness
-        #         performance_coefficient *= 0.98  # Example: reduce by 10%
+    #     # if self.num_iterations>60:
+    #     #     while torch.min(batchNoiseEval*fairness_coefficient / (-lambda1 * performance_coefficient*(klG1 + klG2))) < FAIRNESS_PRIORITY_ratio:
+    #     #         # Adjust the performance coefficient to prioritize fairness
+    #     #         performance_coefficient *= 0.98  # Example: reduce by 10%
 
-        # # Recalculate the dynamic loss with the updated coefficient
+    #     # # Recalculate the dynamic loss with the updated coefficient
 
-        # combined_reward = batchNoiseEval*fairness_coefficient - lambda1*performance_coefficient * (klG1 + klG2)  # Example of combining losses
-        losses_tensor= torch.tensor([torch.mean(batchNoiseEval), torch.mean (-1* (klG1 + klG2))])
-        _, weights = self.CoVWeighting.adjust_loss_weights(losses_tensor)
+    #     # combined_reward = batchNoiseEval*fairness_coefficient - lambda1*performance_coefficient * (klG1 + klG2)  # Example of combining losses
+    #     losses_tensor= torch.tensor([torch.mean(batchNoiseEval), torch.mean (-1* (klG1 + klG2))])
+    #     _, weights = self.CoVWeighting.adjust_loss_weights(losses_tensor)
         
-        adjusted_reward= batchNoiseEval*weights[0] - 1* (klG1 + klG2)*weights[1]
+    #     adjusted_reward= batchNoiseEval*weights[0] - 1* (klG1 + klG2)*weights[1]
         
-        if both == False:
-            return adjusted_reward
-        else:
-            return torch.stack((batchNoiseEval*weights[0], - 1* (klG1 + klG2)*weights[1]+ batchNoiseEval*weights[0]), dim=1)
+    #     if both == False:
+    #         return adjusted_reward
+    #     else:
+    #         return torch.stack((batchNoiseEval*weights[0], - 1* (klG1 + klG2)*weights[1]+ batchNoiseEval*weights[0]), dim=1)
 
         #return combined_reward
         #return batchNoiseEval*20
+        
+    def calculate_reward(self, mu_prime, LM, PLM, weighted=False, both=False):
+        """
+        Compute reward based on two objectives:
+        - Performance (causal log-prob of completions)
+        - Fairness (KL divergence between groups)
+        """
+
+        # Template prompt to evaluate
+        prompt_template = self.template  # e.g., "The <group> is "
+        target_token = "powerful"  # you can also loop through multiple traits if needed
+
+        batch_size = mu_prime.size(0)
+        log_probs = []
+        
+        # Evaluate causal log-probs using perturbed embeddings (mu_prime)
+        for b in range(mu_prime.size(0)):  # batch size
+            group_log_probs = []
+            for group_pair in self.sampling_group_pairs:
+                for group in group_pair:
+                    prompt = prompt_template.replace("<group>", group)
+                    full_text = prompt + target_token
+
+                    # Compute causal log probability of the target
+                    logp_sum, logp_avg = self.compute_log_prob_causal(
+                        LM.model,
+                        LM.tokenizer,
+                        prompt,
+                        " " + target_token,  # ensure correct token alignment
+                        perturbed_embedding=mu_prime[b]  # <--- use one sample of mu_prime per input
+                    )
+                    group_log_probs.append(logp_avg)
+
+            # Convert group log-probs to a torch tensor
+            group_log_probs = torch.tensor(group_log_probs, device=self.device)
+            log_probs.append(group_log_probs.mean())
+
+        # Performance metric = mean log prob across groups
+        performance_score = torch.stack(log_probs)
+
+        # Fairness: KL divergence between groups' output under perturbed embeddings
+        klG1, klG2 = self.kl_perf(
+            LM,
+            PLM,
+            mu_prime,
+            self.prime1,
+            self.sampling_group_pairs,
+            "The <group> is powerful"
+        )
+
+        # Use CoVWeighting to adaptively balance performance and fairness
+        loss_tensor = torch.tensor([
+            torch.mean(performance_score),
+            torch.mean(-1 * (klG1 + klG2))
+        ], device=self.device)
+
+        _, weights = self.CoVWeighting.adjust_loss_weights(loss_tensor)
+
+        adjusted_reward = performance_score * weights[0] - (klG1 + klG2) * weights[1]
+
+        if both:
+            return torch.stack((
+                performance_score * weights[0],
+                adjusted_reward
+            ), dim=1)
+        else:
+            return adjusted_reward
+
 
     def calculate_embedding(self,actor, sentence: str):
         #inputs = self.tokenizer(sentence, return_tensors='pt')
@@ -1186,7 +1324,7 @@ class Reward(object):
                 sentence = self.template.format(group)
 
                 # Tokenize the sentence
-                sentence_tokens = actor.tokenizer.encode(sentence, return_tensors='pt').squeeze().tolist()
+                sentence_tokens = actor.tokenizer.encode(sentence)
                 sentence_token_str = actor.tokenizer.convert_ids_to_tokens(sentence_tokens)
 
                 # Find the start and end index of the group in the sentence
@@ -1198,13 +1336,13 @@ class Reward(object):
 
                 # Iterate over the tokenized sentence and find where the group starts and ends
 
-                inputs = actor.tokenizer(sentence, return_tensors='pt')
+                inputs = actor.tokenizer(sentence, return_tensors='pt').to(self.device)
                 inputs = {key: value.to(self.device) for key, value in inputs.items()}
 
                 group_token_id = actor.tokenizer.encode(" " + group)
                   #group_positions = (inputs['input_ids'] == group_token_id[0]).nonzero(as_tuple=True)[1]
                 group_start_positions = (inputs['input_ids'] == group_token_id[0]).nonzero(as_tuple=True)[1]
-                group_positions = [group_start_positions + i for i in range(len(group_token_id))]
+                group_positions = torch.cat([group_start_positions + i for i in range(len(group_token_id))])
 
                 # Calculate the sentence embeddings and extract the group embeddings
                 sentence_embedding = self.calculate_embedding(actor,  sentence)
@@ -1271,7 +1409,7 @@ class Reward(object):
 
         primeB = group_embeddings.unsqueeze(0).expand(self.Bigbatch_size, -1, -1,-1,-1)
 
-        prime1 = group_embeddings.unsqueeze(0).expand((1,-1,-1,-1,-1))
+        prime1 = group_embeddings.unsqueeze(0).expand(1, -1, -1, -1, -1)
         self.garbage_dict_count += 1
         self.garbage_dict[self.garbage_dict_count] = group_embeddings
         self.garbage_dict_count += 1
@@ -1281,86 +1419,123 @@ class Reward(object):
         return prime1, primeB
 
     # SAME AS LOG PROB, WE CAN NOT PREDICT FORWARD WITH A VERY LOW LOGIT AN DTHEN ADD THIS, THE REUSLT REMAINS NEGLIGIBLE.
-    def get_neutral_score(self, LM, tmplt, trait):# here you should predict multi token based on a sentence that you already added to the current trait token.
-        selected_gpu = sys.argv[0]
+    # def get_neutral_score(self, LM, tmplt, trait):# here you should predict multi token based on a sentence that you already added to the current trait token.
+    #     selected_gpu = sys.argv[0]
 
-        device = self.device #torch.device(f'cuda:{selected_gpu}')
+    #     device = self.device #torch.device(f'cuda:{selected_gpu}')
 
-        self.count += 1
-        if self.neutral_count % 500 == 0:
-          gc.collect()
-          self.neutral_count = 0
+    #     self.count += 1
+    #     if self.neutral_count % 500 == 0:
+    #       gc.collect()
+    #       self.neutral_count = 0
 
 
-        # Tokenize the sentence template without the mask token and the trait
-        sentence = tmplt.replace('<mask>', '') #+ trait
-        print ("Sentence ",sentence)
+    #     # Tokenize the sentence template without the mask token and the trait
+    #     sentence = tmplt.replace('<mask>', '') #+ trait
+    #     print ("Sentence ",sentence)
 
-        inputs = LM.tokenizer(sentence, return_tensors='pt')
-        inputs = {key: value.to(device) for key, value in inputs.items()}
+    #     inputs = LM.tokenizer(sentence, return_tensors='pt')
+    #     inputs = {key: value.to(device) for key, value in inputs.items()}
 
-        # Tokenize the trait and get its token IDs, excluding special tokens like [CLS] and [SEP]
-        trait_ids = list(LM.tokenizer.encode(" "+trait))
-        trait_ids= [trait_ids[0]]
-        # Calculate the position where the trait starts in the input sequence
-        trait_start_pos = inputs['input_ids'].size(1) - len(trait_ids)-1
+    #     # Tokenize the trait and get its token IDs, excluding special tokens like [CLS] and [SEP]
+    #     trait_ids = list(LM.tokenizer.encode(" "+trait))
+    #     trait_ids= [trait_ids[0]]
+    #     # Calculate the position where the trait starts in the input sequence
+    #     trait_start_pos = inputs['input_ids'].size(1) - len(trait_ids)-1
 
-        # Initialize log probability
-        logit_sum = torch.tensor(0.0, dtype=torch.float32, device=device, requires_grad=True)
-        inputs=inputs.to(device)
-        # Predict the probability of each token in the trait
-        with torch.no_grad():
-            outputs = LM.model(**inputs)
-            logits = outputs["logits"]
-        #outputs= self.to_cpu(outputs)
+    #     # Initialize log probability
+    #     logit_sum = torch.tensor(0.0, dtype=torch.float32, device=device, requires_grad=True)
+    #     inputs=inputs.to(device)
+    #     # Predict the probability of each token in the trait
+    #     with torch.no_grad():
+    #         outputs = LM.model(**inputs)
+    #         logits = outputs["logits"]
+    #     #outputs= self.to_cpu(outputs)
 
-        print ("logits.size() = ",logits.size())
-        #logits=logits.to(torch.device("cpu"))
-        #pdb.set_trace()
+    #     print ("logits.size() = ",logits.size())
+    #     #logits=logits.to(torch.device("cpu"))
+    #     #pdb.set_trace()
 
-        # Iterate over the trait_ids and sum their corresponding logits
-        for i, trait_id in enumerate(trait_ids):
-            #token_logits = logits[0, trait_start_pos + i, :]  # Get the logits for the current token position
-            token_logits = logits[0, -1, :]
-            trait_logit = token_logits[trait_id]  # Get the logit for the current trait_id
-            logit_sum = logit_sum + trait_logit  # Sum the logits, maintaining the computational graph
-            print ("trait_logit",trait_logit , trait_id , trait_ids , trait)
+    #     # Iterate over the trait_ids and sum their corresponding logits
+    #     for i, trait_id in enumerate(trait_ids):
+    #         #token_logits = logits[0, trait_start_pos + i, :]  # Get the logits for the current token position
+    #         token_logits = logits[0, -1, :]
+    #         trait_logit = token_logits[trait_id]  # Get the logit for the current trait_id
+    #         logit_sum = logit_sum + trait_logit  # Sum the logits, maintaining the computational graph
+    #         print ("trait_logit",trait_logit , trait_id , trait_ids , trait)
         
-        # Ensure logit_sum is a single-value tensor; no need for view() here as it's already a single value
-        print ("neutral score", logit_sum)
+    #     # Ensure logit_sum is a single-value tensor; no need for view() here as it's already a single value
+    #     print ("neutral score", logit_sum)
 
-        self.garbage_dict_count += 1
-        self.garbage_dict[self.garbage_dict_count] = outputs
-        self.garbage_dict_count += 1
-        self.garbage_dict[self.garbage_dict_count] = inputs
-        self.garbage_dict_count += 1
-        self.garbage_dict[self.garbage_dict_count] = logits
-        self.garbage_dict_count += 1
-        self.garbage_dict[self.garbage_dict_count] = token_logits
-        self.garbage_dict_count += 1
-        self.garbage_dict[self.garbage_dict_count] = trait_logit
-        self.garbage_dict_count += 1
-        self.garbage_dict[self.garbage_dict_count] = trait_ids
-        self.garbage_dict_count += 1
-        self.garbage_dict[self.garbage_dict_count] = trait_start_pos
-        self.garbage_dict_count += 1
-        self.garbage_dict[self.garbage_dict_count] = logit_sum
-        self.garbage_dict_count += 1
-        self.garbage_dict[self.garbage_dict_count] = trait
-        self.garbage_dict_count += 1
-        self.garbage_dict[self.garbage_dict_count] = sentence
+    #     self.garbage_dict_count += 1
+    #     self.garbage_dict[self.garbage_dict_count] = outputs
+    #     self.garbage_dict_count += 1
+    #     self.garbage_dict[self.garbage_dict_count] = inputs
+    #     self.garbage_dict_count += 1
+    #     self.garbage_dict[self.garbage_dict_count] = logits
+    #     self.garbage_dict_count += 1
+    #     self.garbage_dict[self.garbage_dict_count] = token_logits
+    #     self.garbage_dict_count += 1
+    #     self.garbage_dict[self.garbage_dict_count] = trait_logit
+    #     self.garbage_dict_count += 1
+    #     self.garbage_dict[self.garbage_dict_count] = trait_ids
+    #     self.garbage_dict_count += 1
+    #     self.garbage_dict[self.garbage_dict_count] = trait_start_pos
+    #     self.garbage_dict_count += 1
+    #     self.garbage_dict[self.garbage_dict_count] = logit_sum
+    #     self.garbage_dict_count += 1
+    #     self.garbage_dict[self.garbage_dict_count] = trait
+    #     self.garbage_dict_count += 1
+    #     self.garbage_dict[self.garbage_dict_count] = sentence
 
-        del trait_ids
-        del trait_id
-        del token_logits
-        del outputs
-        del inputs
-        del trait_start_pos
+    #     del trait_ids
+    #     del trait_id
+    #     del token_logits
+    #     del outputs
+    #     del inputs
+    #     del trait_start_pos
 
-        return logit_sum
+    #     return logit_sum
+    
+    def get_neutral_score(self, LM, prompt_template, trait):
+        """
+        Computes the log-probability score of completing `prompt` with `trait`
+        using causal next-token prediction in Mistral.
+        """
+        self.count += 1
+        self.neutral_count = (self.neutral_count + 1) % 500
+        if self.neutral_count == 0:
+            gc.collect()
+
+        device = self.device
+
+        prompt = prompt_template.replace('<mask>', '').strip()
+        continuation = " " + trait.strip()  # Add space to ensure token boundary
+
+        full_text = prompt + continuation
+        input_ids = LM.tokenizer(full_text, return_tensors='pt').input_ids.to(device)
+        prompt_ids = LM.tokenizer(prompt, return_tensors='pt').input_ids.to(device)
+
+        # Compute log-probability of continuation given prompt
+        with torch.no_grad():
+            outputs = LM.model(input_ids)
+            logits = outputs.logits  # [1, seq_len, vocab_size]
+
+        # We only want to score the continuation tokens
+        start = prompt_ids.shape[1]
+        end = input_ids.shape[1]
+
+        log_probs = []
+        for i in range(start, end):
+            logit = logits[0, i - 1]  # Predict token i given tokens up to i-1
+            token_id = input_ids[0, i]
+            prob = torch.log_softmax(logit, dim=-1)[token_id]
+            log_probs.append(prob)
+
+        total_log_prob = torch.stack(log_probs).sum()  # Sum over continuation
+        return total_log_prob
 
     def calculate_logits(self, LM, tmplt, mu_prime_g, inputs, group):
-        selected_gpu = sys.argv[0]
 
         device = self.device #torch.device(f'cuda:{selected_gpu}')
 
@@ -1371,19 +1546,21 @@ class Reward(object):
 
         # input=inputs.to(self.device)
         with torch.no_grad():
-            inputs_embeds = LM.model.transformer.wte(inputs['input_ids'])
+            inputs_embeds = LM.model.model.embed_tokens(inputs['input_ids'])
 
         inputs_embeds.requires_grad_(True)
         #inputs_embeds.to(torch.device("cpu"))
 
         # Identify the position(s) of the word 'group' in the sentence
         group_token_id = LM.tokenizer.encode(" " + group)
-            #group_positions = (inputs['input_ids'] == group_token_id[0]).nonzero(as_tuple=True)[1]
         group_start_positions = (inputs['input_ids'] == group_token_id[0]).nonzero(as_tuple=True)[1]
+        
+        if group_start_positions.numel() == 0:
+            raise ValueError(f"Group token '{group}' not found in input sentence.")
+        
         group_positions = [group_start_positions + i for i in range(len(group_token_id))]
 
-
-        mu_prime_g = mu_prime_g.view(1, self.num_tokens, LM.model.config.n_embd).to(device)
+        mu_prime_g = mu_prime_g.reshape(1, self.num_tokens, LM.model.config.n_embd).to(device)
 
         # Replace the embeddings for 'group' with mu_prime_g
         p0=group_positions[0]
@@ -1391,20 +1568,20 @@ class Reward(object):
         # for pos in group_positions:
         #     inputs_embeds[0, pos, :] = mu_prime_g[0,pos-p0,:]
 
-        mask = torch.zeros_like(inputs_embeds, dtype=torch.bool)
-        offsets = [pos - p0 for pos in group_positions]
+        # mask = torch.zeros_like(inputs_embeds, dtype=torch.bool)
+        # offsets = [pos - p0 for pos in group_positions]
 
         # Create a tensor of the specific embeddings from mu_prime_g to use for replacement
         # Assuming offsets is a list of integers
 
-        replacement_embeddings = torch.stack([mu_prime_g[0, offset, :] for offset in offsets])
+        replacement_embeddings = torch.stack([mu_prime_g[0, pos - p0, :] for pos in group_positions])
 
         # # Now, iterate over group_positions and replacement_embeddings to update inputs_embeds
         # for i, pos in enumerate(group_positions):
         #     inputs_embeds[0, pos, :] = replacement_embeddings[i]
 
 
-        new_inputs_embeds = inputs_embeds.clone()  # Create a clone to preserve the original data
+        new_inputs_embeds = inputs_embeds.clone().detach()  # Create a clone to preserve the original data
 
         # Now, iterate over group_positions and replacement_embeddings to update new_inputs_embeds
         for i, pos in enumerate(group_positions):
@@ -1421,6 +1598,7 @@ class Reward(object):
         # if inputs_embeds.size(1) < required_length:
         #     extension = torch.zeros((1, len (trait_ids), inputs_embeds.size(2)), device=device)
         #     new_inputs_embeds = torch.cat([new_inputs_embeds, extension], dim=1)
+        extension = None
         required_length = inputs_embeds.size(1) + 5 -1   # Current length + trait tokens - 1
         if inputs_embeds.size(1) < required_length:
             extension = torch.zeros((1, 5, inputs_embeds.size(2)), device=device)
@@ -1437,8 +1615,9 @@ class Reward(object):
         self.garbage_dict[self.garbage_dict_count] = outputs
         self.garbage_dict_count += 1
         self.garbage_dict[self.garbage_dict_count] = new_inputs_embeds
-        self.garbage_dict_count += 1
-        self.garbage_dict[self.garbage_dict_count] = extension
+        if extension is not None:
+            self.garbage_dict_count += 1
+            self.garbage_dict[self.garbage_dict_count] = extension
         self.garbage_dict_count += 1
         self.garbage_dict[self.garbage_dict_count] = replacement_embeddings
         self.garbage_dict_count += 1
@@ -1448,145 +1627,60 @@ class Reward(object):
         self.garbage_dict_count += 1
         self.garbage_dict[self.garbage_dict_count] = inputs_embeds
         self.garbage_dict_count += 1
-        self.garbage_dict[self.garbage_dict_count] = mask
-        self.garbage_dict_count += 1
         self.garbage_dict[self.garbage_dict_count] = inputs
         self.garbage_dict_count += 1
-        self.garbage_dict[self.garbage_dict_count] = offsets
 
         return logits
 
-
     def get_log_prob(self, LM, trait,logits, inputs):
-      # tokenizer = LM.tokenizer
-      # device = self.device
-      # gc.collect()
+        self.count += 1
+        if self.count % 500 == 0:
+          gc.collect()
+          torch.cuda.empty_cache()
+          self.count = 0
 
+        device = self.device
+        # Get the token IDs for the trait
+        trait_ids = LM.tokenizer.encode(" " + trait, add_special_tokens=False)
+        trait_length = len(trait_ids)
 
-      # # Tokenize the sentence template with the group placeholder
-      # # sentence_with_group = sentence_template.format(group=group)
-      # # inputs = tokenizer(sentence_with_group, return_tensors='pt')
+        # Directly compute log probabilities in a way that maintains the computational graph
+        log_probs = []  # Use a list to collect log probabilities for each trait_id
+        start_pos = inputs["input_ids"].shape[1]  # Start position for the trait prediction
 
-      # with torch.no_grad():
-      #   inputs_embeds = LM.model.transformer.wte(inputs['input_ids'])
+        # 3. Ensure logits shape is sufficient
+        expected_length = start_pos + trait_length
+        if logits.shape[1] < expected_length:
+            raise ValueError(f"Logits too short: expected at least {expected_length}, got {logits.shape[1]}")
+        
+        for i, trait_id in enumerate(trait_ids):
+            token_logits = logits[0, start_pos + i - trait_length, :]  # Adjusted for 0-indexing
+            logp = torch.log_softmax(token_logits, dim=-1)[trait_id]
+            log_probs.append(logp)
 
-      # inputs_embeds.requires_grad_(True)
+        # Sum the log probabilities to get a single scalar for backpropagation
+        total_log_prob = torch.sum(torch.stack(log_probs))
+        #print (total_log_prob.device, "total_log_prob" , total_log_prob )
+        #print ("total_log_prob.grad_fn",total_log_prob.grad_fn)
 
-      # # Identify the position(s) of the word 'group' in the sentence
-      # group_token_id = tokenizer.encode(" " + group)
-      #   #group_positions = (inputs['input_ids'] == group_token_id[0]).nonzero(as_tuple=True)[1]
-      # group_start_positions = (inputs['input_ids'] == group_token_id[0]).nonzero(as_tuple=True)[1]
-      # group_positions = [group_start_positions + i for i in range(len(group_token_id))]
+        #print (total_log_prob, "total_log_prob")
+        #total_log_prob.backward(retain_graph=True
+        #token_logits=token_logits.detach()
+        #stable_log_prob=stable_log_prob.detach()
 
+        #total_log_prob=total_log_prob.detach()
+        self.garbage_dict_count += 1
+        self.garbage_dict[self.garbage_dict_count] = token_logits
+        self.garbage_dict_count += 1
+        self.garbage_dict[self.garbage_dict_count] = log_probs
+        self.garbage_dict_count += 1
+        self.garbage_dict[self.garbage_dict_count] = total_log_prob
+        self.garbage_dict_count += 1
+        self.garbage_dict[self.garbage_dict_count] = trait_ids
 
-      # embedding_size = LM.model.config.n_embd
-      # mu_prime_g = mu_prime_g.view(1, self.num_tokens, embedding_size).to(self.device)
-      # #pdb.set_trace()
-
-      # # Replace the embeddings for 'group' with mu_prime_g
-      # p0=group_positions[0]
-      # # #print (group_positions,group, "group_positions" , tokenizer.encode(" " + group)[0],tokenizer.encode(" " + group), (inputs['input_ids'] == group_token_id[0]).nonzero(as_tuple=True),inputs['input_ids']  )
-      # # for pos in group_positions:
-      # #     inputs_embeds[0, pos, :] = mu_prime_g[0,pos-p0,:]
-
-      # mask = torch.zeros_like(inputs_embeds, dtype=torch.bool)
-      # offsets = [pos - p0 for pos in group_positions]
-
-      # # Create a tensor of the specific embeddings from mu_prime_g to use for replacement
-      # replacement_embeddings = torch.stack([mu_prime_g[0, offset, :] for offset in offsets])
-
-      # # # Now, iterate over group_positions and replacement_embeddings to update inputs_embeds
-      # # for i, pos in enumerate(group_positions):
-      # #     inputs_embeds[0, pos, :] = replacement_embeddings[i]
-
-
-      # new_inputs_embeds = inputs_embeds.clone()  # Create a clone to preserve the original data
-
-      # # Now, iterate over group_positions and replacement_embeddings to update new_inputs_embeds
-      # for i, pos in enumerate(group_positions):
-      #     new_inputs_embeds[0, pos, :] = replacement_embeddings[i]
-
-
-      # # Ensure new_inputs_embeds requires gradients
-      # new_inputs_embeds.requires_grad_(True)
-
-      # #print ("new inputs_embeds.requires_grad", new_inputs_embeds.requires_grad, new_inputs_embeds.grad)
-      # # Tokenize the trait to get its token IDs
-
-      # # Extend inputs_embeds to accommodate trait prediction if necessary
-      # required_length = inputs_embeds.size(1) + len(trait_ids) -1   # Current length + trait tokens - 1
-      # if inputs_embeds.size(1) < required_length:
-      #     extension = torch.zeros((1, len (trait_ids), inputs_embeds.size(2)), device=device)
-      #     new_inputs_embeds = torch.cat([new_inputs_embeds, extension], dim=1)
-
-      # # Calculate logits with extended inputs_embeds
-      # outputs = LM.model(inputs_embeds=new_inputs_embeds, return_dict=True)
-      # logits = outputs['logits']
-      # #outputs = LM.model(inputs_embeds=inputs_embeds)
-      self.count += 1
-      if self.count % 500 == 0:
-        gc.collect()
-        torch.cuda.empty_cache()
-        self.count = 0
-      # Get the token IDs for the trait
-      trait_ids = list(LM.tokenizer.encode(" "+ trait))
-
-      # Directly compute log probabilities in a way that maintains the computational graph
-      log_probs = []  # Use a list to collect log probabilities for each trait_id
-      start_pos = inputs['input_ids'].size(1)  # Start position for the trait prediction
-
-      for i, trait_id in enumerate(trait_ids):
-          token_logits = logits[0, start_pos + i , :]  # Adjusted for 0-indexing
-          #print ("token_logits.grad_fn",token_logits.grad_fn)
-          #
-          #token_prob = torch.softmax(token_logits, dim=-1)[trait_id]
-          #token_prob = token_logits[trait_id]
-          stable_log_prob = torch.log_softmax(token_logits, dim=-1)[trait_id]
-
-          #log_prob = torch.log(token_prob)
-          #print (log_prob.requires_grad, "log_prob")
-          #log_probs.append(log_prob)
-          log_probs.append(stable_log_prob)
-
-      # Sum the log probabilities to get a single scalar for backpropagation
-      total_log_prob = torch.sum(torch.stack(log_probs))
-      #print (total_log_prob.device, "total_log_prob" , total_log_prob )
-      #print ("total_log_prob.grad_fn",total_log_prob.grad_fn)
-
-      #print (total_log_prob, "total_log_prob")
-      #total_log_prob.backward(retain_graph=True
-      #token_logits=token_logits.detach()
-      #stable_log_prob=stable_log_prob.detach()
-
-      #total_log_prob=total_log_prob.detach()
-      self.garbage_dict_count += 1
-      self.garbage_dict[self.garbage_dict_count] = token_logits
-      self.garbage_dict_count += 1
-      self.garbage_dict[self.garbage_dict_count] = log_probs
-      self.garbage_dict_count += 1
-      self.garbage_dict[self.garbage_dict_count] = total_log_prob
-      self.garbage_dict_count += 1
-      self.garbage_dict[self.garbage_dict_count] = stable_log_prob
-
-      return total_log_prob
-
-    def to_cpu(self,obj):
-        """
-        Recursively move tensors in nested lists, tuples, or dictionaries to CPU.
-        """
-        if torch.is_tensor(obj):
-            return obj.cpu()
-        elif isinstance(obj, dict):
-            return {k: self.to_cpu(v) for k, v in obj.items()}
-        elif isinstance(obj, (list, tuple)):
-            return type(obj)(self.to_cpu(v) for v in obj)
-        else:
-            return obj
+        return total_log_prob
 
     def get_top_token_probabilities(self, LM, mu_prime_g, sentence, group, num_predictions=200):
-      # Set device for computation
-        selected_gpu = sys.argv[0]
-
         device = self.device #torch.device(f'cuda:{selected_gpu}')
 
         self.top_count += 1
@@ -1595,10 +1689,9 @@ class Reward(object):
             torch.cuda.empty_cache()
             self.top_count = 0
 
-
         # Tokenize the sentence and get the input embeddings
-        inputs = LM.tokenizer(sentence, return_tensors='pt')
-        inputs = {key: value.to(device) for key, value in inputs.items()}
+        inputs = LM.tokenizer(sentence, return_tensors='pt').to(device)
+        input_ids = inputs['input_ids']
 
         # Get the original embeddings for the entire sentence
 
@@ -1606,16 +1699,14 @@ class Reward(object):
             inputs_embeds = LM.model.transformer.wte(inputs['input_ids'])
 
         # Identify the position(s) of the word 'group' in the sentence
-        group_token_id = LM.tokenizer.encode(" " + group)
-            #group_positions = (inputs['input_ids'] == group_token_id[0]).nonzero(as_tuple=True)[1]
-        group_start_positions = (inputs['input_ids'] == group_token_id[0]).nonzero(as_tuple=True)[1]
-
+        group_token_id = LM.tokenizer.encode(" " + group, add_special_tokens=False)
+        group_start_positions = (input_ids == group_token_id[0]).nonzero(as_tuple=True)[1]
         group_positions = [group_start_positions + i for i in range(len(group_token_id))]
 
-        embedding_size = LM.model.config.n_embd  # Get the embedding size from the model configuration
+        # embedding_size = LM.model.config.n_embd  # Get the embedding size from the model configuration
 
         # Reshape or expand mu_prime_g to match the embedding size and replace the embeddings for 'group'
-        mu_prime_g = mu_prime_g.view(1, -1, embedding_size).to(device)  # Adjusted for dynamic size
+        mu_prime_g = mu_prime_g.view(1, -1, LM.model.config.hidden_size).to(device)  # Adjusted for dynamic size
         for pos in group_positions:
             inputs_embeds[0, pos, :] = mu_prime_g[:, pos - group_positions[0], :]
 
@@ -1631,7 +1722,7 @@ class Reward(object):
 
         # Get the logits for the last token
         last_token_logits = logits[0, -1, :]
-        last_token_logits = last_token_logits.to(self.device)
+        # last_token_logits = last_token_logits.to(self.device)
         #print ("last_token_logits", last_token_logits.requires_grad)
         #pdb.set_trace()
         #print ("last_token_logits",last_token_logits)
