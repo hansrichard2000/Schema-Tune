@@ -21,7 +21,7 @@ import torch as T
 import torch.nn as nn
 import torch.optim as optim
 
-from transformers import GPT2LMHeadModel, GPT2Tokenizer
+from transformers import AutoTokenizer, AutoModelForCausalLM
 from torch.nn import CrossEntropyLoss
 from transformers import GPT2Tokenizer, GPT2LMHeadModel, GPT2DoubleHeadsModel
 
@@ -66,7 +66,7 @@ class LearningAgent(object):
         self.num_epochs=num_epochs
         self.actor_lr=actor_lr
 
-        self.embedding_size = actor.model.config.n_embd
+        self.embedding_size = actor.model.config.hidden_size
         self.sampling_group_pairs=sampling_group_pairs# [('man', 'woman') , ('stepfather', 'stepmother')]
         self.pairs_count = len (self.sampling_group_pairs)
         self.pair_size = len (self.sampling_group_pairs[0])
@@ -102,7 +102,7 @@ class LearningAgent(object):
                           inputs = {key: value.to(self.device) for key, value in inputs.items()}
 
                           # Get input embeddings
-                          inputs_embeds = self.actor.model.transformer.wte(inputs['input_ids'])
+                          inputs_embeds = self.actor.model.embed_tokens(inputs['input_ids'])
                           # Replace embeddings for the group_word part with mu_prime_g
                           inputs_embeds[:, 1:1 + num_group_tokens] = mu_prime_g
 
@@ -171,32 +171,42 @@ class LearningAgent(object):
         else:
             return obj
 
-    def calculate_prob(self,LM, inputs):
-        tokenizer = GPT2Tokenizer.from_pretrained('gpt2')
-        selected_gpu = sys.argv[0]
-        dev = 'cuda' if torch.cuda.is_available() else 'cpu'
-        device = torch.device(dev) #torch.device(f'cuda:{selected_gpu}')
+    def calculate_prob(self, LM, inputs, trait: str = "calm"):
+        tokenizer = LM.tokenizer
+        device = self.device
 
         # Tokenize traits and convert to IDs in a batch
-        traits_with_prefix = "calm"
-        trait_tokens = tokenizer(traits_with_prefix, return_tensors='pt')
-        trait_ids = trait_tokens['input_ids'].to(device)
+        trait_tokens = tokenizer(trait, return_tensors='pt').to(device)
+        trait_ids = trait_tokens['input_ids'][0]
         
-        #input_ids = tokenizer.encode(inputs, return_tensors='pt').to(torch.device(f'cuda:{selected_gpu}'))  # Ensure tensors are on the same device as model
-        input_ids = tokenizer.encode(inputs, return_tensors='pt').to(device)  # Ensure tensors are on the same device as model
+        input_tokens = tokenizer(inputs, return_tensors='pt').to(device)  # Ensure tensors are on the same device as model
+        input_ids = input_tokens['input_ids']  # Ensure tensors are on the same device as model
 
         with torch.no_grad():
-                outputs = LM(input_ids=input_ids)
-                logits = outputs.logits
+            outputs = LM(input_ids=input_ids)
+            logits = outputs.logits
+            
         print ("logits.size()",logits.size())
             # Iterate over the trait_ids and sum their corresponding logits
 
-        for i, trait_id in enumerate(trait_ids):
-            token_logits = logits[0, -1, :]
-            trait_logit = token_logits[trait_id]  # Get the logit for the current trait_id
-            print ("trait_logit",trait_logit )
+        # for i, trait_id in enumerate(trait_ids):
+        #     token_logits = logits[0, -1, :]
+        #     trait_logit = token_logits[trait_id]  # Get the logit for the current trait_id
+        #     print ("trait_logit",trait_logit )
 
-        return trait_logit
+        # return trait_logit
+        
+        # Assume we are predicting at the last token position
+        last_token_logits = logits[0, -1, :]  # Shape: (vocab_size,)
+
+        # Compute probability for the trait token(s)
+        probs = torch.softmax(last_token_logits, dim=-1)
+        trait_prob = 1.0
+
+        for trait_id in trait_ids:
+            trait_prob *= probs[trait_id]
+            
+        return trait_prob
 
     def compare_model_parameters(self,model, checkpoint):
         saved_state_dict = checkpoint['model_state_dict']
@@ -215,7 +225,7 @@ class LearningAgent(object):
                     saved_param = saved_state_dict[param_name].detach().cpu().numpy()
                     #print ( "saved_param",saved_param)
                     # Compare the current parameter with the saved parameter
-                    if not np.array_equal(current_param_np, saved_param):
+                    if not np.allclose(current_param_np, saved_param):
                         print(f"Trainable parameter '{param_name}' has changed.")
                         parameters_changed = True
                     else:
@@ -231,72 +241,81 @@ class LearningAgent(object):
             print("Some trainable parameters have changed.")
 
     def test_saved_model(self):
-        device = torch.device('cuda')
-        LM_name = "gpt-2"
-        actor_lr=2e-4
-        ###actor settings
-        in_net=False
-        in_net_init_identity=False
-        out_net=False
-        out_net_init_identity=False
-        freeze_ln=False
-        freeze_pos=False
-        freeze_wte=True
+        device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
+        model_name = "mistralai/Mistral-7B-v0.1" 
+        # actor_lr=2e-4
+        # ###actor settings
+        # in_net=False
+        # in_net_init_identity=False
+        # out_net=False
+        # out_net_init_identity=False
+        # freeze_ln=False
+        # freeze_pos=False
+        # freeze_wte=True
 
-        freeze_ff=True
-        freeze_attn=True
-        dup_lm_head=False
-        dup_lm_head_bias=False
+        # freeze_ff=True
+        # freeze_attn=True
+        # dup_lm_head=False
+        # dup_lm_head_bias=False
 
-        PLM= LanguageModel('gpt-2')#.to(device)
-        actor =ActorNetwork('actor', PLM, device, in_net, in_net_init_identity, out_net, out_net_init_identity, freeze_ln, freeze_pos, freeze_wte, freeze_ff, freeze_attn, dup_lm_head, dup_lm_head_bias, chkpt_dir)#.to(device)
+        PLM= LanguageModel(model_name)
+        LM_model = PLM.model
+        tokenizer = PLM.tokenizer
+        # actor =ActorNetwork('actor', PLM, device, in_net, in_net_init_identity, out_net, out_net_init_identity, freeze_ln, freeze_pos, freeze_wte, freeze_ff, freeze_attn, dup_lm_head, dup_lm_head_bias, chkpt_dir)#.to(device)
 
-        drive_folder = "/home/oshokrol/zero-shot-2/ActorModelCheckpoints1/"
-        checkpoint_filename = "checkpoint2.pth"  # Name of the checkpoint file
-        checkpoint_file = os.path.join(drive_folder, checkpoint_filename)
+        checkpoint_path = "ActorModelCheckpoints1/checkpoint2.pth"  # Name of the checkpoint file
+        checkpoint = torch.load(checkpoint_path, map_location=device)
 
-        #device=torch.device('cpu')
-        PLM= LanguageModel(LM_name)#.to(device)
-        PLM_model=PLM.model
-        #lm_head_model =ActorNetwork('actor', PLM, device, in_net, in_net_init_identity, out_net, out_net_init_identity, freeze_ln, freeze_pos, freeze_wte, freeze_ff, freeze_attn, dup_lm_head, dup_lm_head_bias, chkpt_dir).to(device)
-        lm_head_model= PLM.model
-
-        selected_gpu = sys.argv[0]
-
-        checkpoint = torch.load(checkpoint_file, map_location=torch.device(device))
-
-        model_state = lm_head_model.state_dict()
+        model_state = LM_model.state_dict()
 
         compatible_state_dict = {k: v for k, v in checkpoint['model_state_dict'].items() }
 
         # Print model state dict keys
-        new_state_dict = {}
-        for key, value in checkpoint['model_state_dict'].items():
-            # Adjust the key name as needed to match the model's expected keys
-            new_key = key  # Modify this as needed based on your model's architecture
-            new_state_dict[new_key] = value
+        # new_state_dict = {}
+        # for key, value in checkpoint['model_state_dict'].items():
+        #     # Adjust the key name as needed to match the model's expected keys
+        #     new_key = key  # Modify this as needed based on your model's architecture
+        #     new_state_dict[new_key] = value
 
         # Now try loading the adjusted state dictionary
-        model_state.update(new_state_dict)
-        lm_head_model.load_state_dict(model_state, strict=True)
+        model_state.update(compatible_state_dict)
+        LM_model.load_state_dict(model_state, strict=True)
+        LM_model.to(device)
+        
+        print("Model successfully loaded.")
+        
+        # print("Compatible keys found:")
+        # for key in compatible_state_dict.keys():
+        #     print(key)
 
-        print("Compatible keys found:")
-        for key in compatible_state_dict.keys():
-            print(key)
+        # model = lm_head_model.to(device)
+        # print("Model's state dict keys:")
+        # for key in model.state_dict().keys():
+        #     print(key)
 
-        model = lm_head_model.to(device)
-        print("Model's state dict keys:")
-        for key in model.state_dict().keys():
-            print(key)
+        # # Assuming 'checkpoint' is your loaded checkpoint dictionary
+        # print("\nCheckpoint's state dict keys:")
+        # for key in checkpoint['model_state_dict'].keys():
+        #     print(key)
 
-        # Assuming 'checkpoint' is your loaded checkpoint dictionary
-        print("\nCheckpoint's state dict keys:")
-        for key in checkpoint['model_state_dict'].keys():
-            print(key)
-
-        inputs= ["When I was a schoolboy, I was always ", "When I was a schoolgirl, I was always BLANK" , "He was alway ", "She was always "]
-        for inp in inputs:
-            print (inp, self.calculate_prob(model, inp) ,self.calculate_prob(PLM_model,inp) )
+        # inputs= ["When I was a schoolboy, I was always ", "When I was a schoolgirl, I was always BLANK" , "He was alway ", "She was always "]
+        # for inp in inputs:
+        #     print (inp, self.calculate_prob(model, inp) ,self.calculate_prob(PLM_model,inp) )
+        
+        example_inputs = [
+            "When I was a schoolboy, I was always ",
+            "When I was a schoolgirl, I was always ",
+            "He was always ",
+            "She was always "
+        ]
+        
+        for text in example_inputs:
+            input_ids = tokenizer(text, return_tensors="pt").input_ids.to(device)
+            with torch.no_grad():
+                outputs = LM_model(input_ids=input_ids)
+                logits = outputs.logits
+                print(f"Prompt: {text}")
+                print("Logits shape:", logits.shape)
 
     def ppo_update(self, samples, noise_obj, reward_obj, PLM,actor, epoch):
         (mu_prime_Batch)=samples
@@ -304,7 +323,7 @@ class LearningAgent(object):
         batch_rewards = reward_obj.calculate_reward(mu_prime_Batch, actor, PLM)
         batch_rewards = batch_rewards.clone().requires_grad_(True)
         batch_rewards.retain_grad()
-        batch_rewards = batch_rewards.to(self.device).double()  # Ensure it's on the correct device and in double precision
+        batch_rewards = batch_rewards.to(self.device).float()  # Ensure it's on the correct device and in double precision
         self.num_tokens=noise_obj.num_tokens
         #action_log_probs_batch=self.calculate_action_log_probs(self.actor, mu_prime_Batch)
         #old_action_log_probs_batch=self.calculate_action_log_probs(self.old_actor, mu_prime_Batch)
@@ -315,7 +334,7 @@ class LearningAgent(object):
         next_state_estimate = torch.mean(batch_rewards)  # Keep as tensor for gradient tracking
         next_state_estimate.retain_grad()
 
-        adv_targ=next_state_estimate
+        adv_targ = next_state_estimate
         adv_targ.retain_grad()
         policy_loss= -adv_targ *200#.mean()
         #print ("policy loss magnified by 100", policy_loss)
@@ -342,20 +361,24 @@ class LearningAgent(object):
         memory_manager.delete_memory(reward_obj.garbage_dict)
         reward_obj.garbage_dict={}
 
-        mu_prime_Batch.detach()
-        del mu_prime_Batch
-        batch_rewards.detach()
-        del batch_rewards
-        next_state_estimate.detach()
-        del next_state_estimate
-        adv_targ.detach()
-        del adv_targ
-        del R0
+        # mu_prime_Batch.detach()
+        # del mu_prime_Batch
+        # batch_rewards.detach()
+        # del batch_rewards
+        # next_state_estimate.detach()
+        # del next_state_estimate
+        # adv_targ.detach()
+        # del adv_targ
+        # del R0
+        
+        for tensor_var in [mu_prime_Batch, batch_rewards, next_state_estimate, adv_targ, R0]:
+            tensor_var.detach()
+            del tensor_var
 
         gc.collect()
         torch.cuda.empty_cache()
-        inputsentences= ["The schoolgirl is  ", "The schoolboy is  " , "He is ", "She is"]
-        for inp in inputsentences:
+        input_sentences= ["The schoolgirl is  ", "The schoolboy is  " , "He is ", "She is"]
+        for inp in input_sentences:
             print (inp, self.calculate_prob(actor.model, inp) ,self.calculate_prob(PLM.model, inp) )
 
     def compare_model_parameters(self, model, checkpoint):
@@ -375,7 +398,7 @@ class LearningAgent(object):
                   saved_param = saved_state_dict[param_name].detach().cpu().numpy()
                   #print ( "saved_param",saved_param)
                   # Compare the current parameter with the saved parameter
-                  if not np.array_equal(current_param_np, saved_param):
+                  if not np.allclose(current_param_np, saved_param, atol=1e-6):
                       print(f"Trainable parameter '{param_name}' has changed.")
                       parameters_changed = True
                   else:
