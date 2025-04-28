@@ -1,4 +1,4 @@
-LM_name = "gpt2"
+LM_name = "mistralai/Mistral-7B-v0.1"
 actor_lr=8e-5
 in_net=False
 in_net_init_identity=False

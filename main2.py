@@ -147,7 +147,7 @@ def test_saved_model():
     dup_lm_head=False
     dup_lm_head_bias=False
 
-    PLM= LanguageModel('gpt-2')#.to(device)
+    PLM= LanguageModel('mistralai/Mistral-7B-v0.1')#.to(device)
     #actor =ActorNetwork('actor', PLM, device, in_net, in_net_init_identity, out_net, out_net_init_identity, freeze_ln, freeze_pos, freeze_wte, freeze_ff, freeze_attn, dup_lm_head, dup_lm_head_bias)#.to(device)
 
     drive_folder = "ActorModelCheckpoints1/"

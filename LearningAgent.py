@@ -171,8 +171,7 @@ class LearningAgent(object):
         else:
             return obj
 
-    def calculate_prob(self, LM, inputs, trait: str = "calm"):
-        tokenizer = LM.tokenizer
+    def calculate_prob(self, LM, tokenizer, inputs, trait: str = "calm"):
         device = self.device
 
         # Tokenize traits and convert to IDs in a batch
@@ -372,14 +371,14 @@ class LearningAgent(object):
         # del R0
         
         for tensor_var in [mu_prime_Batch, batch_rewards, next_state_estimate, adv_targ, R0]:
-            tensor_var.detach()
+            tensor_var = tensor_var.detach() if isinstance(tensor_var, torch.Tensor) else tensor_var
             del tensor_var
 
         gc.collect()
         torch.cuda.empty_cache()
         input_sentences= ["The schoolgirl is  ", "The schoolboy is  " , "He is ", "She is"]
         for inp in input_sentences:
-            print (inp, self.calculate_prob(actor.model, inp) ,self.calculate_prob(PLM.model, inp) )
+            print(inp, self.calculate_prob(actor.model, actor.tokenizer, inp), self.calculate_prob(PLM.model, PLM.tokenizer, inp))
 
     def compare_model_parameters(self, model, checkpoint):
       saved_state_dict = checkpoint['model_state_dict']

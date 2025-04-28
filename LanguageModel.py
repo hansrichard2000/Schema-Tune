@@ -93,7 +93,7 @@ class LanguageModel(nn.Module, metaclass=SingletonType):
 
         # Get the word token embeddings (WTE)
         with T.no_grad():
-            embeddings = self.model.transformer.wte(input_ids)
+            embeddings = self.model.model.embed_tokens(input_ids)
         
         return embeddings
 

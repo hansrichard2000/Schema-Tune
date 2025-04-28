@@ -111,6 +111,7 @@ class Noise:
     def __init__(self, actor, PLM, reward_obj, sampling_group_pairs, device, batch_size, traits, bayesian_samples, bayesian_raw_samples, variance_scale_factor, template, num_samples, maxiter, improvement_threshold, mixed_sampling_weight,num_restarts,
                     raw_samples,batch_limit,upsample_quotient):
         #self.lambda1=lambda1
+        self.sampling_group_pairs= sampling_group_pairs
         self.num_tokens= max(
             len(actor.tokenizer.encode(" " + word, add_special_tokens=False))
             for pair in self.sampling_group_pairs
@@ -131,7 +132,7 @@ class Noise:
         self.device = device #T.device('cuda')
         self.upsample_quotient = upsample_quotient
         self.embedding_dim= actor.input_dim
-        self.sampling_group_pairs= sampling_group_pairs #[('man', 'woman'), ('stepfather', 'stepmother')]
+         #[('man', 'woman'), ('stepfather', 'stepmother')]
         self.num_groups= len(self.sampling_group_pairs)
         self.num_groups_per_pair = len(self.sampling_group_pairs[0])  #Assuming each tuple in group_pairs has the same number of elements
         self.template = template #"the {} is powerful."
@@ -271,6 +272,15 @@ class Noise:
               # Add noise in the direction of normalized difference
               norm_diff = diff / torch.norm(diff, dim=-1, keepdim=True)
               perturbed_embeddings = norm_diff #+ gaussian_noise
+              
+              if perturbed_embeddings.size(0) != self.num_tokens:
+                  padding_needed = self.num_tokens - perturbed_embeddings.size(0)
+                  
+                  if padding_needed > 0:
+                      padding = torch.zeros(padding_needed, perturbed_embeddings.size(1), device=self.device)
+                      perturbed_embeddings = torch.cat([perturbed_embeddings, padding], dim=0)
+                  else:
+                      perturbed_embeddings = perturbed_embeddings[:self.num_tokens, :]
 
               # Store perturbed embeddings
               U[i] = perturbed_embeddings.unsqueeze(0)
@@ -422,7 +432,8 @@ class Noise:
             noise_tensor = self.gaussian_noise_subspace(X_reshaped).detach()
 
             mu_prime_B = self.calculate_noisy_embeddings(self.group_embeddings.detach(), noise_tensor, True).to(self.device)
-            
+            if mu_prime_B.dim() == 4:  # (batch, 2, group_len, hidden_dim)
+                mu_prime_B = mu_prime_B[:, 0, :, :]  # Keep only group side
             #flattened_mu = self.normalize_batch_mu(mu_prime_B)
             #mu_prime_B = flattened_mu.to(self.device)
             
@@ -628,6 +639,7 @@ class Noise:
         candidates=candidates.to(self.device)
         best_indices = sorted_indices[:self.batch_size]
         best_indices=best_indices.to(self.device)
+        best_indices = best_indices.to(new_mu_flat.device)
         best_mu = new_mu_flat[best_indices].squeeze(dim=1)
 
         best_mu = best_mu.to(self.device)
@@ -785,6 +797,8 @@ class Noise:
 
         # Convert group_embeddings to a tensor with the shape (group_pair_id, group_id, embedding)
         group_embeddings_tensor = T.stack([T.stack(pair) for pair in group_embeddings])
+        
+        group_embeddings_tensor = group_embeddings_tensor[:, 0, :, :]
 
         return group_embeddings_tensor
 
@@ -839,6 +853,10 @@ class Noise:
         # Calculate noisy base embedding
         if checknoise==True:
           self.sample(actor, PLM)
+          
+          self.mu_prime_Batch = self.mu_prime_Batch[:, 0:1, :, :]
+          self.mu_prime_Batch = self.mu_prime_Batch.squeeze(1)
+          
           noisy_base_embedding = self.calculate_noisy_embeddings(group_embeddings.detach(), self.mu_prime_Batch.to(self.device), checknoise).to(self.device)
 
           return noisy_base_embedding, group_embeddings
@@ -861,17 +879,15 @@ class ActorNetwork(nn.Module,metaclass=SingletonType):
         self.num_batches = num_batches
         self.dup_lm_head= dup_lm_head
         self.checkpoint_file= chkpt_dir+'checkpoint2.pth'
-        in_layer_sizes = []
-        out_layer_sizes = []
         self.in_net= in_net
         self.out_net=out_net
         self.model = language_model.model.to(self.device)
         self.input_dim = language_model.model.config.hidden_size
         self.dropout = lr_drop
-        orth_gain = 1.41
-        in_net_init_identity = True
         self.freeze_ln=freeze_ln
         self.freeze_wte= freeze_wte
+        self.freeze_ff = freeze_ff
+        self.freeze_attn = freeze_attn
         self.freeze_pos=freeze_pos
         self.total_layers = len(self.model.model.layers)
         target_parameters = 0
@@ -894,77 +910,127 @@ class ActorNetwork(nn.Module,metaclass=SingletonType):
         start_unfreeze_layer = max(0, total_layers - 4 - self.current_epoch)
         print ("start_unfreeze_layer",start_unfreeze_layer)
 
+        base_params = []
+        lm_head_params = []
+        
+        # Freeze everything first
         for name, param in self.model.named_parameters():
-            # Initially freeze all parameters
-            param.requires_grad = False
+            if 'norm' in name:
+                param.requires_grad = not self.freeze_ln
             
-            match = re.match(r"model\.layers\.(\d+)\.(input_layernorm|post_attention_layernorm)\.(weight|bias)", name)
-
-            if self.current_epoch<2:
-                if 'model.norm' in name:
-                    param.requires_grad = True
-                continue
-                
-            elif match and self.current_epoch > 2:
-                layer_index = int(match.group(1))  # Convert captured layer index to integer
-                #print ("layer_index",layer_index)
-                #print ("match", match)
-                # Calculate the layer to start unfreezing from, based on the current epoch
-                if layer_index >= start_unfreeze_layer:
-                    param.requires_grad = True  
-            # if 'ln' in name or 'norm' in name:
-            #     param.requires_grad = not self.freeze_ln
-            
-            # Optional: Unfreeze embeddings based on flags
-            if 'model.embed_tokens' in name:
+            if 'embed_tokens' in name or 'embed_positions' in name:
                 param.requires_grad = not self.freeze_wte
-            if 'model.layers' in name and 'self_attn' in name:
-                param.requires_grad = not self.freeze_attn
-            if 'mlp' in name:
-                param.requires_grad = not self.freeze_ff
-            if 'rotary_emb' in name:
-                param.requires_grad = not self.freeze_pos
-            
-            # Additional selective unfreezing by epoch
-            if self.current_epoch > 5 and 'model.layers.31' in name:
-                param.requires_grad = True
-            if self.current_epoch > 6 and 'model.layers.30' in name:
-                param.requires_grad = True
-            if self.current_epoch > 7 and 'model.layers.29' in name:
-                param.requires_grad = True
-            
-            # if 'wpe' in name or 'position_embeddings' in name or 'pos_drop' in name:
-            #     param.requires_grad = not self.freeze_pos
-
-            # if 'wte' in name:  # Token embeddings
-            #     param.requires_grad = not self.freeze_wte
-            
-            # if self.current_epoch >5 and 'h.11' in name:
-            #     param.requires_grad =True
                 
-            # if self.current_epoch >6 and 'h.10' in name:
-            #     param.requires_grad =True
+            if 'self_attn' in name or 'mlp' in name:
+                param.requires_grad = not (self.freeze_attn and self.freeze_ff)
+                
+            # Progressive unfreeezing based on layer index
+            layer_match = re.search(r'blocks\.(\d+)\.', name)
+            if layer_match:
+                layer_idx = int(layer_match.group(1))
+                if layer_idx >= start_unfreeze_layer:
+                    param.requires_grad = True
+            
+            if self.current_epoch > 5 and re.search(r'blocks\.(\d+)\.', name):
+                layer_idx = int(layer_match.group(1))
+                if layer_idx >= total_layers - 2:
+                    param.requires_grad = True
+                    
+            if self.current_epoch > 6 and re.search(r'blocks\.(\d+)\.', name):
+                layer_idx = int(layer_match.group(1))
+                if layer_idx >= total_layers - 3:
+                    param.requires_grad = True
+            
+            # Classify parameters into optimizer groups
+            if param.requires_grad:
+                if 'norm' in name or 'output_projection' in name:
+                    lm_head_params.append(param)
+                else:
+                    base_params.append(param)
+                    
+        # Prevent overlap of parameters
+        base_params = list(set(base_params) - set(lm_head_params))
+        
+        # Setup the optimizer
+        self.optimizer = torch.optim.AdamW([
+            {'params': base_params, 'lr': self.lr},
+            {'params': lm_head_params, 'lr': self.lr * self.dropout}
+        ], betas=(0.9, 0.95), eps=1e-8)
+        
+        self.scheduler = torch.optim.lr_scheduler.CosineAnnealingLR(self.optimizer, T_max=self.num_batches)
+        
+        print(f"Updated optimizer: {len(base_params)} base params, {len(lm_head_params)} LM head params.")
+        # for name, param in self.model.named_parameters():
+        #     # Initially freeze all parameters
+        #     param.requires_grad = False
+            
+        #     match = re.match(r"model\.layers\.(\d+)\.(input_layernorm|post_attention_layernorm)\.(weight|bias)", name)
 
-            # if self.current_epoch >7 and 'h.9' in name:
-            #     param.requires_grad =True
+        #     if self.current_epoch<2:
+        #         if 'model.norm' in name:
+        #             param.requires_grad = True
+        #         continue
+                
+        #     elif match and self.current_epoch > 2:
+        #         layer_index = int(match.group(1))  # Convert captured layer index to integer
+        #         #print ("layer_index",layer_index)
+        #         #print ("match", match)
+        #         # Calculate the layer to start unfreezing from, based on the current epoch
+        #         if layer_index >= start_unfreeze_layer:
+        #             param.requires_grad = True  
+        #     # if 'ln' in name or 'norm' in name:
+        #     #     param.requires_grad = not self.freeze_ln
+            
+        #     # Optional: Unfreeze embeddings based on flags
+        #     if 'model.embed_tokens' in name:
+        #         param.requires_grad = not self.freeze_wte
+        #     if 'model.layers' in name and 'self_attn' in name:
+        #         param.requires_grad = not self.freeze_attn
+        #     if 'mlp' in name:
+        #         param.requires_grad = not self.freeze_ff
+        #     if 'rotary_emb' in name:
+        #         param.requires_grad = not self.freeze_pos
+            
+        #     # Additional selective unfreezing by epoch
+        #     if self.current_epoch > 5 and 'model.layers.31' in name:
+        #         param.requires_grad = True
+        #     if self.current_epoch > 6 and 'model.layers.30' in name:
+        #         param.requires_grad = True
+        #     if self.current_epoch > 7 and 'model.layers.29' in name:
+        #         param.requires_grad = True
+            
+        #     # if 'wpe' in name or 'position_embeddings' in name or 'pos_drop' in name:
+        #     #     param.requires_grad = not self.freeze_pos
 
-            # You could add more specific conditions here based on your model's structure and training needs
+        #     # if 'wte' in name:  # Token embeddings
+        #     #     param.requires_grad = not self.freeze_wte
+            
+        #     # if self.current_epoch >5 and 'h.11' in name:
+        #     #     param.requires_grad =True
+                
+        #     # if self.current_epoch >6 and 'h.10' in name:
+        #     #     param.requires_grad =True
 
-        base_params = [p for n, p in self.model.named_parameters() if 'model.layers.31' not in n and p.requires_grad]
-        norm_params = [p for n, p in self.model.named_parameters() if 'model.norm' in n and p.requires_grad]
+        #     # if self.current_epoch >7 and 'h.9' in name:
+        #     #     param.requires_grad =True
 
-        # Now, set up the optimizer with different learning rates
-        if base_params or norm_params:
-            self.optimizer = torch.optim.AdamW([
-                {'params': base_params, 'lr': self.lr},  # Standard learning rate for base model parameters
-                #{'params': lm_head_params, 'lr': self.lr*0.1}  # Adjusted learning rate for LM head parameters
-                {'params': norm_params, 'lr': self.lr*self.dropout}
-            ])
-        else:
-            raise ValueError("No parameters with requires_grad=True. Check your model's parameter setup.")
+        #     # You could add more specific conditions here based on your model's structure and training needs
 
-        # Setup the scheduler with the optimizer
-        self.scheduler = optim.lr_scheduler.CosineAnnealingLR(self.optimizer, T_max=self.num_batches)
+        # base_params = [p for n, p in self.model.named_parameters() if 'model.layers.31' not in n and p.requires_grad]
+        # norm_params = [p for n, p in self.model.named_parameters() if 'model.norm' in n and p.requires_grad]
+
+        # # Now, set up the optimizer with different learning rates
+        # if base_params or norm_params:
+        #     self.optimizer = torch.optim.AdamW([
+        #         {'params': base_params, 'lr': self.lr},  # Standard learning rate for base model parameters
+        #         #{'params': lm_head_params, 'lr': self.lr*0.1}  # Adjusted learning rate for LM head parameters
+        #         {'params': norm_params, 'lr': self.lr*self.dropout}
+        #     ])
+        # else:
+        #     raise ValueError("No parameters with requires_grad=True. Check your model's parameter setup.")
+
+        # # Setup the scheduler with the optimizer
+        # self.scheduler = optim.lr_scheduler.CosineAnnealingLR(self.optimizer, T_max=self.num_batches)
 
     def forward_wte(self, sentence):
         inputs = self.tokenizer(sentence, return_tensors="pt").to(self.device)
@@ -1077,17 +1143,24 @@ class CoVWeighting:
                 # Update running means for L and loss ratios l
                 self.running_mean_L[i] = decay * self.running_mean_L[i-1] + (1 - decay) * loss.mean().unsqueeze(0)
                 loss_ratio = loss / self.running_mean_L[i]
-                self.running_mean_l[i] = decay * self.running_mean_l[i-1] + (1 - decay) * loss_ratio.mean().unsqueeze(0)
+                loss_mean = loss_ratio.mean().to(self.running_mean_l[i-1].device).unsqueeze(0)
+                self.running_mean_l[i] = decay * self.running_mean_l[i-1] + (1 - decay) * loss_mean
+
 
                 # Update variances for L and l
                 delta_L = loss - self.running_mean_L[i]
-                delta_l = loss_ratio - self.running_mean_l[i]
-                self.running_var_L[i] = decay * self.running_var_L[i-1] + (1 - decay) * (delta_L ** 2).mean().unsqueeze(0)
-                self.running_var_l[i] = decay * self.running_var_l[i-1] + (1 - decay) * (delta_l ** 2).mean().unsqueeze(0)
+                delta_l = loss_ratio - self.running_mean_l[i].to(loss_ratio.device)
+                self.running_var_L[i] = decay * self.running_var_L[i-1].to(delta_L.device) + (1 - decay) * (delta_L ** 2).mean().unsqueeze(0)
+                self.running_var_l[i] = decay * self.running_var_l[i-1].to(delta_l.device) + (1 - decay) * (delta_l ** 2).mean().unsqueeze(0)
+
 
     def compute_weights(self):
         # Compute CoV for each loss and loss ratio
-        cov_l = torch.tensor([torch.sqrt(var) / (mean + 1e-8) for var, mean in zip(self.running_var_l, self.running_mean_l)], device=self.device)
+        cov_l = torch.tensor([
+            torch.sqrt(var.to(self.device)) / (mean.to(self.device) + 1e-8)
+            for var, mean in zip(self.running_var_l, self.running_mean_l)
+        ], device=self.device)
+
 
         # Calculate weights inversely proportional to CoV
         weights = 1 / (cov_l + 1e-8)
@@ -1145,37 +1218,118 @@ class Reward(object):
         self.CoVWeighting=CoVWeighting(2,self.device_cpu) 
         
     @torch.no_grad()
-    def compute_log_prob_causal(self, model, tokenizer, prompt: str, target: str):
+    def compute_log_prob_causal(self, model, tokenizer, prompt, trait_tokens, perturbed_embedding=None):
         """
-        Compute log-probability of target tokens given a prompt using a causal decoder-only model (like Mistral).
+        Compute the causal log probability of `target` given `prompt`, optionally with perturbed embeddings.
         """
-        model.eval()
+        device = next(model.parameters()).device
+
+        # Encode prompt and target separately
+        inputs = tokenizer(prompt, return_tensors='pt').to(device)
+        input_ids = inputs['input_ids']
         
-        # Full input = prompt + target
-        full_input = tokenizer(prompt + target, return_tensors="pt").to(self.device)
-        prompt_input = tokenizer(prompt, return_tensors="pt").to(self.device)
+        trait_inputs = tokenizer(trait_tokens, return_tensors='pt', padding=True).to(device)
+        trait_ids = trait_inputs['input_ids']
+        # attention_mask = torch.ones_like(input_ids, device=device)
         
-        input_ids = full_input.input_ids
-        prompt_len = prompt_input.input_ids.shape[-1]
+        with torch.no_grad():
+            base_embeddings = model.model.embed_tokens(input_ids).clone()
+
+        # Prepare inputs_embeds if perturbed
+        if perturbed_embedding is not None:
+            # Replace the group entity embeddings (assume the group is in the prompt part)
+            group_len = perturbed_embedding.shape[1]
+
+            if perturbed_embedding.shape[0] != base_embeddings.shape[0]:
+                perturbed_embedding = perturbed_embedding.squeeze(0)
+            if len(perturbed_embedding.shape) == 2:
+                perturbed_embedding = perturbed_embedding.unsqueeze(0)
+
+            if perturbed_embedding.shape[0] > 1:
+                perturbed_embedding = perturbed_embedding[0:1, :, :]
+                
+            # If perturbed_embedding batch > 1 (e.g., [2, 2, 4096])
+            if perturbed_embedding.shape[0] != base_embeddings.shape[0]:
+                # Only use the first perturbed sample (assuming batch 0 corresponds to group)
+                perturbed_embedding = perturbed_embedding[0].unsqueeze(0)  # (1, group_len, hidden_dim)
+
+            # Also sanity check if lengths match
+            if perturbed_embedding.shape[1] != (base_embeddings[:, 1:1+perturbed_embedding.shape[1], :]).shape[1]:
+                raise ValueError(f"Mismatch between perturbed embedding length {perturbed_embedding.shape[1]} and base embedding slice length {(base_embeddings[:, 1:1+perturbed_embedding.shape[1], :]).shape[1]}")
+            
+            print("==== DEBUG SHAPES ====")
+            print("base_embeddings shape:", base_embeddings.shape)
+            print("perturbed_embedding shape:", perturbed_embedding.shape)
+            print("=======================")
+            
+            if perturbed_embedding.dim() == 4:
+                perturbed_embedding = perturbed_embedding.squeeze(0)
+
+            if perturbed_embedding.dim() == 3 and perturbed_embedding.shape[0] == 2:
+                perturbed_embedding = perturbed_embedding[0:1]
+            
+            base_embeddings[:, 1:1 + group_len, :] = perturbed_embedding[:, :group_len, :]  # (batch_size, seq_len, vocab_size)
+
+        # Compute log probabilities for the target tokens
+        expanded_embeddings = base_embeddings.repeat(trait_ids.size(0), 1, 1)
         
-        # Forward pass
-        outputs = model(**full_input)
-        logits = outputs.logits
+        # Append trait token embeddings after the prompt embeddings
+        trait_embeddings = model.model.embed_tokens(trait_ids)
+        combined_embeddings = torch.cat([expanded_embeddings, trait_embeddings], dim=1)
+
+        # Build dummy attention mask
+        attention_mask = torch.ones(combined_embeddings.size()[:-1], device=device)
         
-        # Get the logits responsible for generating the target
-        target_logits = logits[:, prompt_len - 1:-1, :]  # shift by 1
+        # Run through the model
+        outputs = model(inputs_embeds=combined_embeddings, attention_mask=attention_mask, output_hidden_states=False)
+        logits = outputs.logits  # (batch_size, sequence_length, vocab_size)
         
-        # Get target token ids
-        target_ids = input_ids[:, prompt_len:]
+        # We care about trait token logits
+        trait_logits = logits[:, -trait_ids.size(1):, :]
         
-        # Compute log-probs
-        log_probs = F.log_softmax(target_logits, dim=-1)
-        target_log_probs = torch.gather(log_probs, dim=2, index=target_ids.unsqueeze(-1)).squeeze(-1)
+        # Compute log probs
+        log_probs = F.log_softmax(trait_logits, dim=-1)
         
-        total_log_prob = target_log_probs.sum(dim=-1).item()
-        avg_log_prob = target_log_probs.mean(dim=-1).item()
+        # Gather the log-prob of the correct trait tokens
+        trait_log_probs = log_probs.gather(2, trait_ids.unsqueeze(-1)).squeeze(-1)
         
-        return total_log_prob, avg_log_prob
+        avg_log_prob = trait_log_probs.mean(dim=1)  # (batch_size,)
+        
+        return avg_log_prob
+
+    # def compute_log_prob_causal(self, model, tokenizer, prompt: str, target: str, perturbed_embedding=None):
+    #     """
+    #     Compute log-probability of target tokens given a prompt using a causal decoder-only model (like Mistral).
+    #     """
+    #     model.eval()
+        
+    #     # Full input = prompt + target
+    #     full_input = tokenizer(prompt + target, return_tensors="pt").to(self.device)
+    #     prompt_input = tokenizer(prompt, return_tensors="pt").to(self.device)
+        
+    #     input_ids = full_input.input_ids
+    #     prompt_len = prompt_input.input_ids.shape[-1]
+        
+    #     # Forward pass
+    #     outputs = model(**full_input)
+    #     logits = outputs.logits
+        
+    #     # Get the logits responsible for generating the target
+    #     target_logits = logits[:, prompt_len - 1:-1, :]  # shift by 1
+        
+    #     # Get target token ids
+    #     target_ids = input_ids[:, prompt_len:]
+        
+    #     # Compute log-probs
+    #     log_probs = F.log_softmax(target_logits, dim=-1)
+    #     target_log_probs = torch.gather(log_probs, dim=2, index=target_ids.unsqueeze(-1)).squeeze(-1)
+        
+    #     total_log_prob = target_log_probs.sum(dim=-1).item()
+    #     avg_log_prob = target_log_probs.mean(dim=-1).item()
+        
+    #     return total_log_prob, avg_log_prob
+    
+    
 
     # def calculate_reward(self, mu_prime, LM, PLM, weighted=False, both= False):
 
@@ -1258,12 +1412,12 @@ class Reward(object):
                     full_text = prompt + target_token
 
                     # Compute causal log probability of the target
-                    logp_sum, logp_avg = self.compute_log_prob_causal(
+                    logp_avg = self.compute_log_prob_causal(
                         LM.model,
                         LM.tokenizer,
                         prompt,
                         " " + target_token,  # ensure correct token alignment
-                        perturbed_embedding=mu_prime[b]  # <--- use one sample of mu_prime per input
+                        perturbed_embedding=mu_prime[b][0:1]  # <--- use one sample of mu_prime per input
                     )
                     group_log_probs.append(logp_avg)
 
@@ -1313,6 +1467,89 @@ class Reward(object):
         return outputs
 
 
+    # def calculate_embeddings(self, actor):
+    #     group_embeddings = []
+
+    #     for group_pair_id, group_pair in enumerate(self.sampling_group_pairs):
+    #         group_embeddings_pair = []
+
+    #         for group_id, group in enumerate(group_pair):
+    #             # Generate the sentence using the template
+    #             sentence = self.template.format(group)
+
+    #             # Tokenize the sentence
+    #             sentence_tokens = actor.tokenizer.encode(sentence)
+    #             sentence_token_str = actor.tokenizer.convert_ids_to_tokens(sentence_tokens)
+
+    #             # Find the start and end index of the group in the sentence
+    #             start_index = sentence.find(group)
+    #             end_index = start_index + len(group)
+
+    #             # Initialize the group indices
+    #             group_indices = []
+
+    #             # Iterate over the tokenized sentence and find where the group starts and ends
+
+    #             inputs = actor.tokenizer(sentence, return_tensors='pt').to(self.device)
+    #             inputs = {key: value.to(self.device) for key, value in inputs.items()}
+
+    #             group_token_id = actor.tokenizer.encode(" " + group)
+    #               #group_positions = (inputs['input_ids'] == group_token_id[0]).nonzero(as_tuple=True)[1]
+    #             group_start_positions = (inputs['input_ids'] == group_token_id[0]).nonzero(as_tuple=True)[1]
+    #             group_positions = torch.cat([group_start_positions + i for i in range(len(group_token_id))])
+
+    #             # Calculate the sentence embeddings and extract the group embeddings
+    #             sentence_embedding = self.calculate_embedding(actor,  sentence)
+    #             group_embedding = sentence_embedding[group_positions, :]#.squeeze()#(dim=-1)
+    #             group_embedding = group_embedding.to(self.device)
+    #             if group_embedding.size(0) != 2:
+    #                 # Calculate the padding needed. In this case, we need one more row.
+    #                 padding_needed = 2 - group_embedding.size(0)
+
+    #                 if padding_needed > 0:
+    #                     # Create a tensor of zeros with the required padding size
+    #                     padding = torch.zeros(padding_needed, group_embedding.size(1))
+    #                     group_embedding = group_embedding.to(self.device)
+    #                     padding = padding.to(self.device)
+
+    #                 # Concatenate the original tensor with the padding
+    #                 group_embedding = torch.cat([group_embedding, padding], dim=0)
+    #                 group_embedding = group_embedding.to(self.device)
+
+    #             group_embeddings_pair.append(group_embedding)
+
+    #         group_embeddings.append(group_embeddings_pair)
+
+    #     # Convert group_embeddings to a tensor with the shape (group_pair_id, group_id, embedding)
+    #     group_embeddings_tensor = T.stack([T.stack(pair) for pair in group_embeddings])
+
+    #     self.garbage_dict_count += 1
+    #     self.garbage_dict[self.garbage_dict_count] = group_embeddings
+    #     self.garbage_dict_count += 1
+    #     self.garbage_dict[self.garbage_dict_count] = group_embeddings_pair
+    #     self.garbage_dict_count += 1
+    #     self.garbage_dict[self.garbage_dict_count] = group_embeddings_tensor
+    #     self.garbage_dict_count += 1
+    #     self.garbage_dict[self.garbage_dict_count] = sentence_embedding
+    #     self.garbage_dict_count += 1
+    #     self.garbage_dict[self.garbage_dict_count] = inputs
+    #     self.garbage_dict_count += 1
+    #     self.garbage_dict[self.garbage_dict_count] = sentence_tokens
+    #     self.garbage_dict_count += 1
+    #     self.garbage_dict[self.garbage_dict_count] = sentence_token_str
+    #     self.garbage_dict_count += 1
+    #     self.garbage_dict[self.garbage_dict_count] = group_token_id
+
+
+    #     del group_embeddings
+    #     del group_embeddings_pair
+    #     del group_token_id
+    #     del group_start_positions
+    #     del group_positions
+    #     del sentence_embedding
+
+    #     return group_embeddings_tensor
+    
     def calculate_embeddings(self, actor):
         group_embeddings = []
 
@@ -1320,84 +1557,59 @@ class Reward(object):
             group_embeddings_pair = []
 
             for group_id, group in enumerate(group_pair):
-                # Generate the sentence using the template
                 sentence = self.template.format(group)
 
-                # Tokenize the sentence
                 sentence_tokens = actor.tokenizer.encode(sentence)
                 sentence_token_str = actor.tokenizer.convert_ids_to_tokens(sentence_tokens)
 
-                # Find the start and end index of the group in the sentence
-                start_index = sentence.find(group)
-                end_index = start_index + len(group)
-
-                # Initialize the group indices
-                group_indices = []
-
-                # Iterate over the tokenized sentence and find where the group starts and ends
-
-                inputs = actor.tokenizer(sentence, return_tensors='pt').to(self.device)
+                inputs = actor.tokenizer(sentence, return_tensors='pt')
                 inputs = {key: value.to(self.device) for key, value in inputs.items()}
 
                 group_token_id = actor.tokenizer.encode(" " + group)
-                  #group_positions = (inputs['input_ids'] == group_token_id[0]).nonzero(as_tuple=True)[1]
                 group_start_positions = (inputs['input_ids'] == group_token_id[0]).nonzero(as_tuple=True)[1]
+
+                if group_start_positions.numel() == 0:
+                    raise ValueError(f"Group token '{group}' not found in sentence: {sentence}")
+
                 group_positions = torch.cat([group_start_positions + i for i in range(len(group_token_id))])
 
-                # Calculate the sentence embeddings and extract the group embeddings
-                sentence_embedding = self.calculate_embedding(actor,  sentence)
-                group_embedding = sentence_embedding[group_positions, :]#.squeeze()#(dim=-1)
-                group_embedding = group_embedding.to(self.device)
+                sentence_embedding = self.calculate_embedding(actor, sentence)
+                group_embedding = sentence_embedding[group_positions, :].to(self.device)
+
                 if group_embedding.size(0) != 2:
-                    # Calculate the padding needed. In this case, we need one more row.
                     padding_needed = 2 - group_embedding.size(0)
 
-                    # Create a tensor of zeros with the required padding size
-                    padding = torch.zeros(padding_needed, group_embedding.size(1))
-                    group_embedding = group_embedding.to(self.device)
-                    padding = padding.to(self.device)
-
-                    # Concatenate the original tensor with the padding
-                    group_embedding = torch.cat([group_embedding, padding], dim=0)
-                    group_embedding = group_embedding.to(self.device)
+                    if padding_needed > 0:
+                        padding = torch.zeros(padding_needed, group_embedding.size(1), device=self.device)
+                        group_embedding = torch.cat([group_embedding, padding], dim=0)
+                    else:
+                        group_embedding = group_embedding[:2, :]  # truncate if more tokens
 
                 group_embeddings_pair.append(group_embedding)
 
             group_embeddings.append(group_embeddings_pair)
 
-        # Convert group_embeddings to a tensor with the shape (group_pair_id, group_id, embedding)
         group_embeddings_tensor = T.stack([T.stack(pair) for pair in group_embeddings])
 
         self.garbage_dict_count += 1
-        self.garbage_dict[self.garbage_dict_count] = group_embeddings
-        self.garbage_dict_count += 1
-        self.garbage_dict[self.garbage_dict_count] = group_embeddings_pair
-        self.garbage_dict_count += 1
         self.garbage_dict[self.garbage_dict_count] = group_embeddings_tensor
-        self.garbage_dict_count += 1
-        self.garbage_dict[self.garbage_dict_count] = sentence_embedding
-        self.garbage_dict_count += 1
-        self.garbage_dict[self.garbage_dict_count] = inputs
-        self.garbage_dict_count += 1
-        self.garbage_dict[self.garbage_dict_count] = sentence_tokens
-        self.garbage_dict_count += 1
-        self.garbage_dict[self.garbage_dict_count] = sentence_token_str
-        self.garbage_dict_count += 1
-        self.garbage_dict[self.garbage_dict_count] = group_token_id
-
-
-        del group_embeddings
-        del group_embeddings_pair
-        del group_token_id
-        del group_start_positions
-        del group_positions
-        del sentence_embedding
 
         return group_embeddings_tensor
 
     def calculate_prime(self, PLM):
+        
+        group_embeddings = self.calculate_embeddings(PLM)
+        
+        if group_embeddings.dim() == 4:
+            # If already has batch dimension, no need to unsqueeze
+            primeB = group_embeddings.expand(self.Bigbatch_size, -1, -1, -1, -1).contiguous()
+            prime1 = group_embeddings.expand(1, -1, -1, -1, -1).contiguous()
+        else:
+            # If not yet batched, unsqueeze first
+            primeB = group_embeddings.unsqueeze(0).expand(self.Bigbatch_size, -1, -1, -1, -1).contiguous()
+            prime1 = group_embeddings.unsqueeze(0).expand(1, -1, -1, -1, -1).contiguous()
 
-        group_embeddings = T.zeros((self.num_groups, self.num_groups_per_pair, self.embedding_dim))  # Initialize tensor for embeddings
+        # group_embeddings = T.zeros((self.num_groups, self.num_groups_per_pair, self.embedding_dim))  # Initialize tensor for embeddings
 
         # for group_pair_id, group_pair in enumerate(self.sampling_group_pairs):
         #     for group_id, group in enumerate(group_pair):
@@ -1405,11 +1617,11 @@ class Reward(object):
 
         #         # Store embeddings in the tensor
         #         group_embeddings[group_pair_id, group_id, :] = embedding
-        group_embeddings = self.calculate_embeddings(PLM)
+        # group_embeddings = self.calculate_embeddings(PLM)
 
-        primeB = group_embeddings.unsqueeze(0).expand(self.Bigbatch_size, -1, -1,-1,-1)
+        # primeB = group_embeddings.unsqueeze(0).expand(self.Bigbatch_size, -1, -1,-1,-1)
 
-        prime1 = group_embeddings.unsqueeze(0).expand(1, -1, -1, -1, -1)
+        # prime1 = group_embeddings.unsqueeze(0).expand(1, -1, -1, -1, -1)
         self.garbage_dict_count += 1
         self.garbage_dict[self.garbage_dict_count] = group_embeddings
         self.garbage_dict_count += 1
@@ -1696,7 +1908,7 @@ class Reward(object):
         # Get the original embeddings for the entire sentence
 
         with torch.no_grad():
-            inputs_embeds = LM.model.transformer.wte(inputs['input_ids'])
+            inputs_embeds = LM.model.model.embed_tokens(inputs['input_ids'])
 
         # Identify the position(s) of the word 'group' in the sentence
         group_token_id = LM.tokenizer.encode(" " + group, add_special_tokens=False)
@@ -1708,6 +1920,7 @@ class Reward(object):
         # Reshape or expand mu_prime_g to match the embedding size and replace the embeddings for 'group'
         mu_prime_g = mu_prime_g.view(1, -1, LM.model.config.hidden_size).to(device)  # Adjusted for dynamic size
         for pos in group_positions:
+            mu_prime_g = mu_prime_g.to(inputs_embeds.dtype)
             inputs_embeds[0, pos, :] = mu_prime_g[:, pos - group_positions[0], :]
 
         # Calculate the output with the modified embeddings
@@ -1955,10 +2168,10 @@ class Reward(object):
         for batchid in range(mu_prime.size(0)):
             for group_pair_id, (group1, group2) in enumerate(group_pairs):
                 # Retrieve embeddings for each group in the pair for LM and PLM
-                mu_prime_g1_lm = mu_prime[batchid,group_pair_id, 0,:, :].squeeze(0)
-                mu_prime_g2_lm = mu_prime[batchid,group_pair_id, 1,:, :].squeeze(0)
-                mu_prime_g1_plm = prime[batchid,group_pair_id, 0, :,:].squeeze(0)
-                mu_prime_g2_plm = prime[batchid,group_pair_id, 1, :,:].squeeze(0)
+                mu_prime_g1_lm = mu_prime[batchid, :, :]
+                mu_prime_g2_lm = mu_prime[batchid, :, :]
+                mu_prime_g1_plm = prime
+                mu_prime_g2_plm = prime
 
                 # Calculate top token probabilities and logits using LM and PLM for each group
                 top_token_probs_1_lm, logits_1_lm = self.get_top_token_probabilities(LM, mu_prime_g1_lm, tmplt.replace("<group>", group1), group1, num_predictions)
