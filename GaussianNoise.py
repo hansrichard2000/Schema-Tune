@@ -1257,10 +1257,10 @@ class Reward(object):
             if perturbed_embedding.shape[1] != (base_embeddings[:, 1:1+perturbed_embedding.shape[1], :]).shape[1]:
                 raise ValueError(f"Mismatch between perturbed embedding length {perturbed_embedding.shape[1]} and base embedding slice length {(base_embeddings[:, 1:1+perturbed_embedding.shape[1], :]).shape[1]}")
             
-            print("==== DEBUG SHAPES ====")
-            print("base_embeddings shape:", base_embeddings.shape)
-            print("perturbed_embedding shape:", perturbed_embedding.shape)
-            print("=======================")
+            # print("==== DEBUG SHAPES ====")
+            # print("base_embeddings shape:", base_embeddings.shape)
+            # print("perturbed_embedding shape:", perturbed_embedding.shape)
+            # print("=======================")
             
             if perturbed_embedding.dim() == 4:
                 perturbed_embedding = perturbed_embedding.squeeze(0)
